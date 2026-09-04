@@ -1,0 +1,6 @@
+# Legacy workspace-write configuration only. Do not add this table when a beta
+# permission profile is active; add the vault root through that profile instead.
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+writable_roots = ["/absolute/path/to/your/Obsidian vault"]

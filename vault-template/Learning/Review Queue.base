@@ -1,0 +1,12 @@
+filters:
+  and:
+    - file.inFolder("Learning/Topics")
+    - 'next_review != ""'
+views:
+  - type: table
+    name: Review queue
+    order:
+      - file.name
+      - state
+      - last_review
+      - next_review

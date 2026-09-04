@@ -1,0 +1,6 @@
+interface:
+  display_name: "Learn"
+  short_description: "Stateful tutoring with durable Obsidian notes"
+  default_prompt: "Use $learn to teach me a topic from my current understanding and schedule later review."
+policy:
+  allow_implicit_invocation: false
