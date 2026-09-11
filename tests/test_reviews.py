@@ -24,12 +24,14 @@ class ReviewTests(LearnTestCase):
         review = self.cli("review", "--topic", "cli-review", "--score", "2", "--on-date", "2030-01-10")
         self.assertEqual(review.returncode, 0, review.stderr)
         topic = self.topic("cli-review")
-        self.assertEqual(topic["state"], "retrievable")
+        self.assertEqual(topic["state"], "introduced")
         self.assertEqual(topic["review"]["next_review"], "2030-01-13")
+        record = next((self.vault / "Learning" / "_system" / "reviews").glob("*.json"))
+        self.assertEqual(json.loads(record.read_text(encoding="utf-8"))["kind"], "score-only")
 
-    def test_score_three_marks_delayed_transfer_robust(self):
+    def test_score_three_without_evidence_does_not_promote_mastery(self):
         self.start(title="Transfer Review")
         self.assertEqual(self.finish(payload=base_finish("applicable")).returncode, 0)
         review = self.cli("review", "--topic", "transfer-review", "--score", "3", "--on-date", "2030-02-01")
         self.assertEqual(review.returncode, 0, review.stderr)
-        self.assertEqual(self.topic("transfer-review")["state"], "robust")
+        self.assertEqual(self.topic("transfer-review")["state"], "applicable")

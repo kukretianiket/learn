@@ -6,11 +6,11 @@ from tests.common import ROOT, LearnTestCase
 
 
 class HookTests(LearnTestCase):
-    def test_pending_prompt_associates_by_cwd(self):
+    def test_pending_prompt_requires_exact_session_even_with_unrelated_cwd(self):
         other = self.cwd.parent / "other"
         other.mkdir()
-        self.hook("UserPromptSubmit", "wrong-session", "t1", "wrong prompt", other)
-        self.hook("UserPromptSubmit", "right-session", "t2", "right prompt", self.cwd)
+        self.hook("UserPromptSubmit", "wrong-session", "t1", "$learn wrong prompt", other)
+        self.hook("UserPromptSubmit", "right-session", "t2", "$learn right prompt", self.cwd)
         result = self.cli(
             "start",
             "--title",
@@ -18,7 +18,9 @@ class HookTests(LearnTestCase):
             "--goal",
             "Test association",
             "--cwd",
-            str(self.cwd),
+            str(other),
+            "--session-id",
+            "right-session",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["session_id"], "right-session")
@@ -81,9 +83,86 @@ class HookTests(LearnTestCase):
         follow.assert_called_once()
         self.assertTrue(follow.call_args.args[3].startswith("🤖 Tutor · "))
 
-    def test_inactive_hook_only_leaves_pending_record(self):
-        self.hook("UserPromptSubmit", "inactive", "t1", "pending only")
+    def test_inactive_hook_captures_only_explicit_activation(self):
+        self.hook("UserPromptSubmit", "unrelated", "t0", "ordinary unrelated work")
+        self.assertEqual(list((self.vault / "Learning" / "_system" / "pending").glob("*.json")), [])
+        self.hook("UserPromptSubmit", "inactive", "t1", "$learn pending only")
         self.hook("Stop", "inactive", "t1", "must not be logged")
         self.assertFalse(list((self.vault / "Learning" / "Sessions").glob("*.md")))
         pending = list((self.vault / "Learning" / "_system" / "pending").glob("*.json"))
         self.assertEqual(len(pending), 1)
+
+    def test_vscode_skill_link_captures_prompt_and_starts_exact_lesson(self):
+        session = "01a08010-28c4-7022-a8e6-748ef82e0eb9"
+        prompt = (
+            "[$learn](/Users/kukretianiket/Documents/stuff/learn/.agents/skills/learn/SKILL.md) "
+            "Refresh Python OOP and inheritance for understanding PyTorch nn.Module."
+        )
+        # Do not use self.start(): it prefixes nonliteral prompts with $learn,
+        # which would hide the IDE activation bug.
+        for _ in range(2):
+            self.hook("UserPromptSubmit", session, "ide-turn", prompt)
+        result = self.cli(
+            "start", "--session-id", session,
+            "--title", "Python OOP", "--goal", "Understand nn.Module inheritance",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        started = json.loads(result.stdout)
+        self.assertEqual(started["session_id"], session)
+        lesson_path = self.vault / "Learning/_system/lessons" / f"{started['lesson_id']}.json"
+        lesson = json.loads(lesson_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(lesson["messages"]), 1)
+        self.assertEqual(lesson["messages"][0]["markdown"], prompt)
+        self.assertEqual(lesson["messages"][0]["event_identity"]["turn_id"], "ide-turn")
+        self.hook("Stop", session, "ide-turn", "The attached lesson is ready.")
+        self.assertIn("The attached lesson is ready.", self.note_for(session).read_text(encoding="utf-8"))
+
+    def test_activation_formats_preserve_explicit_only_boundary(self):
+        spec = importlib.util.spec_from_file_location(
+            "learnctl_activation_test", ROOT / ".agents/skills/learn/scripts/learnctl.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        accepted = [
+            "$learn", "  $learn Teach me", "\n$learn\nTeach me",
+            "[$learn](/project/.agents/skills/learn/SKILL.md) Teach me",
+            "[$learn](</project with spaces/Ω/learn/SKILL.md>) Teach me",
+            "[$learn](/project (copy)/learn/SKILL.md) Teach me",
+            "[$learn](.agents/skills/learn/SKILL.md)",
+        ]
+        rejected = [
+            "ordinary unrelated work", "$learning Teach me", "$learn-other Teach me",
+            "Explain how $learn works", "Use [$learn](/project/learn/SKILL.md)",
+            "> [$learn](/project/learn/SKILL.md) quoted report",
+            "`$learn`", "```\n$learn\n```",
+            "[$other](/project/learn/SKILL.md) Teach me",
+            "[$learn](/project/other/SKILL.md) Teach me",
+            "[$learn](https://example.org/learn/SKILL.md) Teach me",
+            "[$learn](/project/learn/SKILL.md", "[$learn]()",
+        ]
+        for prompt in accepted:
+            with self.subTest(prompt=prompt):
+                self.assertTrue(module.is_explicit_learn_activation(prompt))
+        for index, prompt in enumerate(rejected):
+            with self.subTest(prompt=prompt):
+                self.assertFalse(module.is_explicit_learn_activation(prompt))
+                self.hook("UserPromptSubmit", f"unrelated-{index}", "t1", prompt)
+        self.assertEqual(list((self.vault / "Learning/_system/pending").glob("*.json")), [])
+
+    def test_hook_errors_are_recorded_without_transcript_text(self):
+        self.start()
+        note = self.note_for()
+        relative = next(item["note_relative"] for item in self.active_records() if item["session_id"] == "session-a")
+        note.write_text("---\ninvalid: note\n---\n", encoding="utf-8")
+        secret = "PRIVATE ASSISTANT TRANSCRIPT MUST NOT ENTER HEALTH"
+        result = self.hook("Stop", "session-a", "broken-turn", secret)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        health_path = self.vault / "Learning" / "_system" / "operational.json"
+        health_text = health_path.read_text(encoding="utf-8")
+        health = json.loads(health_text)
+        self.assertNotIn(secret, health_text)
+        self.assertEqual(health["last_error"]["operation"], "hook-capture")
+        self.assertEqual(health["last_error"]["turn_id"], "broken-turn")
+        self.assertEqual(health["pending_rendering_repairs"], [relative])
+        status = self.cli("status", "--json-output")
+        self.assertEqual(json.loads(status.stdout)["operational_health"], health)

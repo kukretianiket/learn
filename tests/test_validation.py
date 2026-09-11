@@ -113,6 +113,14 @@ class ValidationTests(LearnTestCase):
         rendering = (ROOT / ".agents/skills/learn/references/rendering.md").read_text(encoding="utf-8")
         self.assertIn("context --next-mcq --choices", skill)
         self.assertIn("--correct-count", skill)
+        self.assertIn("--question-id <stable-id>", skill)
+        self.assertIn("Do not run `learnctl context` every turn", skill)
+        self.assertIn("checkpoint --json", skill)
+        self.assertIn("diagnose the relevant prerequisites", skill)
+        self.assertIn("diagnose only where it helps", skill)
+        self.assertIn("inspect the learner’s attempt first", skill)
+        self.assertIn("begin with unaided retrieval", skill)
+        self.assertIn("verify sources first", skill)
         self.assertIn("learnctl.py open --session-id", skill)
         self.assertIn("## Lesson begins", skill)
         self.assertIn("Knowledge evaluation begins", skill)
@@ -132,8 +140,8 @@ class ValidationTests(LearnTestCase):
         random_source = mock.Mock()
         random_source.sample.return_value = [3, 1]
         with mock.patch.object(module.secrets, "SystemRandom", return_value=random_source):
-            first = module.issue_mcq_positions(active, 5, 2, "turn-1")
-            second = module.issue_mcq_positions(active, 5, 2, "turn-1")
+            first = module.issue_mcq_positions(active, 5, 2, "diagnostic-1", "turn-1")
+            second = module.issue_mcq_positions(active, 5, 2, "diagnostic-1", "turn-2")
         self.assertEqual(first, [1, 3])
         self.assertEqual(second, [1, 3])
         random_source.sample.assert_called_once_with(range(0, 5), 2)
@@ -190,9 +198,11 @@ class ValidationTests(LearnTestCase):
     def test_validation_finds_missing_asset_and_source(self):
         self.start()
         note = self.note_for()
+        lesson_id = self.active_records()[0]["lesson_id"]
+        transcript_end = f"<!-- LEARN:TRANSCRIPT:{lesson_id}:END -->"
         text = note.read_text(encoding="utf-8").replace(
-            "<!-- LEARN:TRANSCRIPT:END -->",
-            "![[Assets/missing image.png]]\n\n[[Sources/missing-source]]\n<!-- LEARN:TRANSCRIPT:END -->",
+            transcript_end,
+            f"![[Assets/missing image.png]]\n\n[[Sources/missing-source]]\n{transcript_end}",
         )
         note.write_text(text, encoding="utf-8")
         result = self.cli("validate", "--session", str(note))
@@ -416,3 +426,46 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("Skill conflict", result.stderr)
         self.assertEqual((skill / "SKILL.md").read_text(encoding="utf-8"), "personal")
+
+    def test_invalid_arguments_are_rejected_before_any_install_write(self):
+        result = run_install(
+            self.home,
+            self.vault,
+            "--learning-folder",
+            "../escaped",
+            "--review-intervals",
+            "3,1",
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse((self.vault.parent / "escaped").exists())
+        self.assertFalse((self.home / ".agents").exists())
+        self.assertFalse((self.home / ".codex").exists())
+        self.assertFalse((self.home / ".config").exists())
+
+        intervals = run_install(self.home, self.vault, "--review-intervals", "3,1")
+        self.assertEqual(intervals.returncode, 2)
+        self.assertIn("unique positive integers", intervals.stderr)
+        self.assertFalse((self.vault / "Learning").exists())
+        self.assertFalse((self.home / ".agents").exists())
+
+    def test_symlink_escape_is_rejected_before_any_install_write(self):
+        outside = self.vault.parent / "outside-learning"
+        outside.mkdir()
+        (self.vault / "Learning").symlink_to(outside, target_is_directory=True)
+        result = run_install(self.home, self.vault)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("resolves outside", result.stderr)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse((self.home / ".agents").exists())
+
+    def test_review_storage_symlink_is_rejected_before_install_writes(self):
+        outside = self.vault.parent / "outside-reviews"
+        outside.mkdir()
+        reviews = self.vault / "Learning" / "_system" / "reviews"
+        reviews.parent.mkdir(parents=True)
+        reviews.symlink_to(outside, target_is_directory=True)
+        result = run_install(self.home, self.vault)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Template directory _system/reviews resolves outside", result.stderr)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse((self.home / ".agents").exists())

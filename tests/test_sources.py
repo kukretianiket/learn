@@ -61,6 +61,43 @@ class SourceTests(LearnTestCase):
         self.assertEqual(result["citekey"], "org2026guide")
         self.assertEqual(len(list((self.vault / "Learning" / "Sources").glob("*.md"))), 1)
 
+    def test_source_reverification_updates_metadata_and_preserves_usage_and_personal_content(self):
+        self.start(session="research", title="Reverification", mode="research")
+        initial = source_payload(status="metadata-only", claims=[])
+        first = self.cli("source", "--session-id", "research", "--json", json.dumps(initial))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        note = self.vault / "Learning" / "Sources" / "org2026guide.md"
+        legacy = note.read_text(encoding="utf-8").replace("<!-- LEARN:SOURCE:BEGIN -->\n", "").replace(
+            "\n<!-- LEARN:SOURCE:END -->", ""
+        )
+        personalized = legacy.replace(
+            "learn_type: source", "learn_type: source\npersonal_rating: essential"
+        )
+        note.write_text(personalized + "\nMy durable source annotation.\n", encoding="utf-8")
+
+        verified = source_payload(citekey="ignored-new-key", url="https://EXAMPLE.org/Guide")
+        verified["title"] = "Reverified Guide"
+        verified["precise_locator"] = "Appendix A"
+        second = self.cli("source", "--session-id", "research", "--json", json.dumps(verified))
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(json.loads(second.stdout)["citekey"], "org2026guide")
+
+        record = json.loads(
+            (self.vault / "Learning" / "_system" / "sources" / "org2026guide.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(record["verification_status"], "verified")
+        self.assertEqual(record["title"], "Reverified Guide")
+        self.assertEqual(record["precise_locators"], ["Section 2", "Appendix A"])
+        self.assertEqual(len(record["verification_history"]), 2)
+        active = self.active_records()[0]
+        self.assertEqual(
+            [usage["precise_locator"] for usage in active["source_usages"]], ["Section 2", "Appendix A"]
+        )
+        rendered = note.read_text(encoding="utf-8")
+        self.assertIn("personal_rating: essential", rendered)
+        self.assertIn("My durable source annotation.", rendered)
+        self.assertIn('verification_status: "verified"', rendered)
+
     def test_unverified_source_cannot_support_claims(self):
         payload = source_payload(status="unverified")
         result = self.cli("source", "--json", json.dumps(payload))

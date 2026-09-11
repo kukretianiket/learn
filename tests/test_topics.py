@@ -23,26 +23,38 @@ class TopicTests(LearnTestCase):
         self.start(title="MCQ Boundary")
         payload = base_finish("applicable")
         payload["demonstrated_abilities"] = [
-            {"ability": "Selected the right option", "evidence_type": "mcq", "independent": True, "delayed": False}
+            {
+                "ability": "Selected the right option",
+                "evidence_type": "mcq",
+                "independent": True,
+                "delayed": False,
+                "evidence_refs": ["current"],
+            }
         ]
         result = self.finish(payload=payload)
         self.assertEqual(result.returncode, 2)
-        self.assertIn("requires independent recall", result.stderr)
+        self.assertIn("requires recorded independent recall", result.stderr)
 
     def test_render_preserves_my_notes(self):
         self.start(title="Preservation")
         topic_note = self.vault / "Learning" / "Topics" / "preservation.md"
         original = topic_note.read_text(encoding="utf-8")
-        topic_note.write_text(original + "\nA personal derivation that must survive.\n", encoding="utf-8")
+        personalized = original.replace(
+            "learn_type: topic",
+            "learn_type: topic\npersonal_alias: My own label\npersonal_nested:\n  title: Nested title must survive",
+        )
+        topic_note.write_text(personalized + "\nA personal derivation that must survive.\n", encoding="utf-8")
         result = self.finish(payload=base_finish("retrievable"))
         self.assertEqual(result.returncode, 0, result.stderr)
         rendered = topic_note.read_text(encoding="utf-8")
         self.assertIn("## My notes", rendered)
         self.assertIn("A personal derivation that must survive.", rendered)
+        self.assertIn("personal_alias: My own label", rendered)
+        self.assertIn("  title: Nested title must survive", rendered)
         self.assertIn("Foundations generate", rendered)
 
-    def test_later_failure_can_reduce_state(self):
+    def test_score_only_failure_does_not_claim_a_mastery_downgrade(self):
         self.finish_and_close("s1", "applicable", title="Failure Reduction")
         result = self.cli("review", "--topic", "failure-reduction", "--score", "0", "--on-date", "2030-01-01")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.topic("failure-reduction")["state"], "introduced")
+        self.assertEqual(self.topic("failure-reduction")["state"], "applicable")

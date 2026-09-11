@@ -61,6 +61,78 @@ def validate_vault(raw: str) -> Path:
     return path.resolve()
 
 
+def validate_learning_folder(raw: str) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise InstallError("--learning-folder must be a non-empty relative path")
+    value = raw.strip()
+    path = Path(value)
+    if (
+        path.is_absolute()
+        or "\\" in value
+        or any(ord(character) < 32 for character in value)
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
+        raise InstallError("--learning-folder must be a safe relative path inside the vault")
+    return path.as_posix()
+
+
+def validate_review_intervals(raw: str) -> list[int]:
+    try:
+        values = [int(item.strip()) for item in raw.split(",")]
+    except (AttributeError, ValueError) as exc:
+        raise InstallError("--review-intervals must be comma-separated positive integers") from exc
+    if not values or any(value <= 0 for value in values) or values != sorted(set(values)):
+        raise InstallError("--review-intervals must be unique positive integers in increasing order")
+    return values
+
+
+def require_inside(root: Path, target: Path, label: str) -> Path:
+    resolved_root = root.resolve()
+    resolved_target = target.resolve(strict=False)
+    try:
+        resolved_target.relative_to(resolved_root)
+    except ValueError as exc:
+        raise InstallError(f"{label} resolves outside {resolved_root}: {target}") from exc
+    return resolved_target
+
+
+def preflight_vault_template(vault: Path, learning_folder: str) -> Path:
+    if not VAULT_TEMPLATE.is_dir():
+        raise InstallError(f"Missing vault template: {VAULT_TEMPLATE}")
+    destination = vault / learning_folder
+    require_inside(vault, destination, "Learning destination")
+    relatives = (
+        "Sessions",
+        "Topics",
+        "Sources",
+        "Assets",
+        "_system",
+        "_system/pending",
+        "_system/active",
+        "_system/lessons",
+        "_system/reviews",
+        "_system/topics",
+        "_system/sources",
+    )
+    for relative in relatives:
+        require_inside(destination, destination / relative, f"Template directory {relative}")
+    for source in VAULT_TEMPLATE.iterdir():
+        if source.is_file() and not source.name.startswith("."):
+            require_inside(destination, destination / source.name, f"Template file {source.name}")
+    return destination
+
+
+def preflight_home_destinations() -> None:
+    home = Path.home().resolve()
+    for label, target in (
+        ("Skill destination directory", home / ".agents" / "skills"),
+        ("Hook configuration directory", home / ".codex"),
+        ("Codex configuration directory", home / ".codex"),
+        ("Learn configuration directory", home / ".config" / "learn-codex"),
+    ):
+        require_inside(home, target, label)
+
+
 def install_vault_template(vault: Path, learning_folder: str) -> list[Path]:
     destination = vault / learning_folder
     created = []
@@ -72,11 +144,13 @@ def install_vault_template(vault: Path, learning_folder: str) -> list[Path]:
         "_system",
         "_system/pending",
         "_system/active",
-        "_system/events",
+        "_system/lessons",
+        "_system/reviews",
         "_system/topics",
         "_system/sources",
     ):
         target = destination / relative
+        require_inside(destination, target, f"Template directory {relative}")
         if not target.exists():
             target.mkdir(parents=True, exist_ok=True)
             created.append(target)
@@ -84,6 +158,7 @@ def install_vault_template(vault: Path, learning_folder: str) -> list[Path]:
         if not source.is_file() or source.name.startswith("."):
             continue
         target = destination / source.name
+        require_inside(destination, target, f"Template file {source.name}")
         if not target.exists():
             if source.name == "Review Queue.base" and learning_folder != "Learning":
                 content = source.read_text(encoding="utf-8").replace("Learning/Topics", f"{learning_folder}/Topics")
@@ -359,6 +434,14 @@ def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
         vault = validate_vault(args.vault)
+        args.learning_folder = validate_learning_folder(args.learning_folder)
+        validate_review_intervals(args.review_intervals)
+        preflight_vault_template(vault, args.learning_folder)
+        preflight_home_destinations()
+        if args.vault_name is not None and (
+            not args.vault_name.strip() or any(ord(character) < 32 for character in args.vault_name)
+        ):
+            raise InstallError("--vault-name must be a non-empty single-line value")
         hooks_path = Path.home() / ".codex" / "hooks.json"
         preflight_skill(args.replace)
         preflight_hooks(hooks_path)

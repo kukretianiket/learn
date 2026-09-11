@@ -7,24 +7,28 @@ class SessionTests(LearnTestCase):
     def test_mcq_positions_are_randomized_once_per_turn_and_support_multi_select(self):
         self.start(session="session-a", title="Random Positions")
         first = self.cli(
-            "context", "--session-id", "session-a", "--next-mcq", "--choices", "4", "--correct-count", "1"
+            "context", "--session-id", "session-a", "--next-mcq", "--question-id", "diagnostic-1",
+            "--choices", "4", "--correct-count", "1"
         )
         repeat = self.cli(
-            "context", "--session-id", "session-a", "--next-mcq", "--choices", "4", "--correct-count", "1"
+            "context", "--session-id", "session-a", "--next-mcq", "--question-id", "diagnostic-1",
+            "--choices", "4", "--correct-count", "1"
         )
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(repeat.returncode, 0, repeat.stderr)
         self.assertEqual(json.loads(first.stdout), json.loads(repeat.stdout))
 
         changed = self.cli(
-            "context", "--session-id", "session-a", "--next-mcq", "--choices", "4", "--correct-count", "2"
+            "context", "--session-id", "session-a", "--next-mcq", "--question-id", "diagnostic-1",
+            "--choices", "4", "--correct-count", "2"
         )
         self.assertEqual(changed.returncode, 2)
         self.assertIn("already issued", changed.stderr)
 
         self.hook("UserPromptSubmit", "session-a", "turn-2", "My first diagnostic answer")
         multi = self.cli(
-            "context", "--session-id", "session-a", "--next-mcq", "--choices", "5", "--correct-count", "2"
+            "context", "--session-id", "session-a", "--next-mcq", "--question-id", "diagnostic-2",
+            "--choices", "5", "--correct-count", "2"
         )
         self.assertEqual(multi.returncode, 0, multi.stderr)
         payload = json.loads(multi.stdout)
@@ -35,7 +39,8 @@ class SessionTests(LearnTestCase):
 
         self.start(session="session-b", title="Separate Positions")
         other = self.cli(
-            "context", "--session-id", "session-b", "--next-mcq", "--choices", "4", "--correct-count", "1"
+            "context", "--session-id", "session-b", "--next-mcq", "--question-id", "diagnostic-1",
+            "--choices", "4", "--correct-count", "1"
         )
         self.assertEqual(other.returncode, 0, other.stderr)
         records = {item["session_id"]: item for item in self.active_records()}
@@ -67,15 +72,22 @@ class SessionTests(LearnTestCase):
 
     def test_close_after_final_stop(self):
         self.start()
+        note = self.note_for()
+        personalized = note.read_text(encoding="utf-8").replace(
+            "status: active", "status: active\npersonal_property: keep-me"
+        )
+        note.write_text(personalized, encoding="utf-8")
         result = self.finish(payload=base_finish("introduced"))
         self.assertEqual(result.returncode, 0, result.stderr)
-        note = self.note_for()
-        self.assertTrue(self.active_records()[0]["close_after_stop"])
+        finishing = self.active_records()[0]
+        self.assertEqual(finishing["status"], "finishing")
+        self.assertEqual(finishing["expected_finishing"]["turn_id"], "turn-1")
         self.close_after_finish("session-a", text="Your next review is scheduled.")
         self.assertEqual(self.active_records(), [])
         text = note.read_text(encoding="utf-8")
         self.assertIn("Your next review is scheduled.", text)
         self.assertIn("status: completed", text)
+        self.assertIn("personal_property: keep-me", text)
 
     def test_markdown_math_and_callouts_are_preserved(self):
         self.start()

@@ -25,9 +25,9 @@ class CleanupTests(LearnTestCase):
         aborted = self.cli("abort", "--session-id", "closed-session")
         self.assertEqual(aborted.returncode, 0, aborted.stderr)
 
-        self.hook("UserPromptSubmit", "fresh-pending", "fresh-turn", "A recent ordinary prompt")
+        self.hook("UserPromptSubmit", "fresh-pending", "fresh-turn", "$learn A recent prompt")
         fresh_pending = self.records_for("pending", "fresh-pending")[0]
-        self.hook("UserPromptSubmit", "old-pending", "old-turn", "An abandoned prompt")
+        self.hook("UserPromptSubmit", "old-pending", "old-turn", "$learn An abandoned prompt")
         old_pending = self.records_for("pending", "old-pending")[0]
         old_record = json.loads(old_pending.read_text(encoding="utf-8"))
         old_record["created_at"] = "2000-01-01T00:00:00+00:00"
@@ -62,7 +62,8 @@ class CleanupTests(LearnTestCase):
         self.assertTrue(self.records_for("pending", "live-session"))
         self.assertFalse(old_pending.exists())
         self.assertTrue(fresh_pending.exists())
-        self.assertFalse(orphan_active.exists())
+        self.assertTrue(orphan_active.exists())
+        self.assertTrue(any("needs rendering repair" in warning for warning in payload["warnings"]))
         self.assertTrue(all(not path.exists() for path in closed_events))
         self.assertTrue(closed_note.exists())
         self.assertEqual(set((self.vault / "Learning" / "_system" / "topics").glob("*.json")), topics_before)

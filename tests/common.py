@@ -24,6 +24,7 @@ def base_finish(state="introduced"):
         "independent": False,
         "delayed": False,
         "summary": "Not attempted",
+        "evidence_refs": [],
     }
     if state in {"retrievable", "applicable", "robust"}:
         abilities = [
@@ -32,6 +33,7 @@ def base_finish(state="introduced"):
                 "evidence_type": "recall",
                 "independent": True,
                 "delayed": state == "robust",
+                "evidence_refs": ["current"],
             }
         ]
     if state in {"applicable", "robust"}:
@@ -41,6 +43,7 @@ def base_finish(state="introduced"):
             "independent": True,
             "delayed": state == "robust",
             "summary": "Transferred the model to a changed example",
+            "evidence_refs": ["current"],
         }
     return {
         "final_mental_model": "Foundations generate the derived result through explicit dependencies.",
@@ -54,6 +57,24 @@ def base_finish(state="introduced"):
         "source_citekeys": [],
         "transfer_task_result": transfer,
         "suggested_review_score": 2,
+        "reassessment": False,
+        "contrary_evidence_refs": [],
+    }
+
+
+def base_review_assessment(state="introduced"):
+    finish = base_finish(state)
+    return {
+        key: finish[key]
+        for key in (
+            "evidence_state",
+            "demonstrated_abilities",
+            "transfer_task_result",
+            "misconceptions",
+            "unresolved_gaps",
+            "reassessment",
+            "contrary_evidence_refs",
+        )
     }
 
 
@@ -75,6 +96,8 @@ class LearnTestCase(unittest.TestCase):
 
     def env(self):
         env = os.environ.copy()
+        env.pop("CODEX_THREAD_ID", None)
+        env.pop("CODEX_SESSION_ID", None)
         env["HOME"] = str(self.home)
         env["PYTHONPYCACHEPREFIX"] = str(self.home / ".pycache")
         return env
@@ -104,6 +127,8 @@ class LearnTestCase(unittest.TestCase):
         return self.cli("hook", input_text=json.dumps(payload))
 
     def start(self, session="session-a", turn="turn-1", prompt="$learn teach me", title="Test Topic", mode="learn"):
+        if not prompt.lstrip().startswith("$learn"):
+            prompt = "$learn " + prompt
         self.hook("UserPromptSubmit", session, turn, prompt)
         result = self.cli(
             "start",
@@ -125,7 +150,17 @@ class LearnTestCase(unittest.TestCase):
 
     def active_records(self):
         folder = self.vault / "Learning" / "_system" / "active"
-        return [json.loads(path.read_text(encoding="utf-8")) for path in folder.glob("*.json")]
+        records = []
+        for path in folder.glob("*.json"):
+            binding = json.loads(path.read_text(encoding="utf-8"))
+            if binding.get("lesson_id"):
+                lesson = self.vault / "Learning" / "_system" / "lessons" / f"{binding['lesson_id']}.json"
+                record = json.loads(lesson.read_text(encoding="utf-8"))
+                record["session_id"] = binding["session_id"]
+                records.append(record)
+            else:
+                records.append(binding)
+        return records
 
     def topic(self, slug="test-topic"):
         path = self.vault / "Learning" / "_system" / "topics" / f"{slug}.json"
@@ -135,13 +170,18 @@ class LearnTestCase(unittest.TestCase):
         active = next(item for item in self.active_records() if item["session_id"] == session)
         return self.vault / active["note_relative"]
 
-    def close_after_finish(self, session, turn="final-turn", text="Lesson complete."):
+    def close_after_finish(self, session, turn=None, text="Lesson complete."):
+        if turn is None:
+            record = next(item for item in self.active_records() if item["session_id"] == session)
+            turn = record.get("expected_finishing", {}).get("turn_id") or "final-turn"
         result = self.hook("Stop", session, turn, text)
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
 def install_env(home: Path):
     env = os.environ.copy()
+    env.pop("CODEX_THREAD_ID", None)
+    env.pop("CODEX_SESSION_ID", None)
     env["HOME"] = str(home)
     env["PYTHONPYCACHEPREFIX"] = str(home / ".pycache")
     return env

@@ -8,9 +8,22 @@
 - In a Markdown table, keep each formula within one cell and avoid a raw `|` inside math; use `\vert` when a vertical bar is mathematical. Mermaid labels do not render MathJax reliably, so use short plain-language or Unicode labels there and explain formal notation outside the diagram.
 - Preserve raw Markdown: code fences, tables, callouts, Mermaid, and display math must remain unwrapped.
 - Use native Obsidian callouts: `[!question]`, `[!hint]`, `[!failure]`, `[!success]`, `[!definition]`, and `[!warning]`.
-- Put generated `.svg` and `.png` files only in `Learning/Assets` and embed them as `![[Assets/name.ext]]` (optionally with a width).
+- Put generated `.svg` and `.png` files only in the configured learning folder's `Assets` directory (normally `Learning/Assets`) and embed them as `![[Assets/name.ext]]` (optionally with a width).
 - Link references with ordinary Markdown links or `[[Sources/<citekey>]]`.
 - Never put model citation tokens, tool traces, shell output, or internal process commentary in the lesson.
+
+## Choose and teach with a visual
+
+At the route and at a difficult conceptual step, consider what the learner needs to see: relationships, a process over time, geometry, quantities, or a concrete worked trace. Use a visual when it makes that relationship easier to infer than prose. A route map does not replace a mechanism diagram, and a decorative image does not satisfy this purpose.
+
+- Use native Mermaid for a small dependency map, flow, sequence, or state transition. Keep it readable in the half-width Obsidian pane.
+- For geometry or quantitative behavior, use a small accurate SVG or a plot generated with available tools. Label axes, units, conditions, and illustrative versus measured data. Use existing capabilities; do not install a rendering stack for the lesson.
+- When an authoritative source already has a better diagram, inspect the actual figure and caption, then provide a descriptive Markdown link to its real figure/section location with attribution. State what to notice and how it connects to the current explanation. If you cannot inspect the image, label it as an uninspected optional resource rather than describing its contents as checked.
+- Prefer linking to an external figure over copying it into the vault unless permission or license allows reuse. Cite the source for an adapted figure and identify your simplifications. Save generated local assets only in the configured Learning folder's `Assets` directory; honor a custom learning-folder name.
+
+Before showing a generated visual, check arrow direction, labels, scale, and the assumptions it implies. When an available renderer can produce an image, render and inspect it and repair unreadable or incorrect output. If visual inspection is unavailable, use simple established syntax and describe validation honestly; never claim to have viewed a render you did not inspect. A complicated visual that cannot be checked should be simplified or replaced with an inspected source link and a self-contained explanation.
+
+Introduce the visual with its purpose, explain the one relationship it reveals, and use it for a prediction or comparison when that helps learning. For a discovery task, reveal only the setup before the learner predicts; show the explanatory result afterward. Do not expose an answer through an image or caption while claiming to test unaided recall. If a figure adds no explanatory value, omit it; substantial lessons still retain the required small route map.
 
 ## Mermaid concept maps
 

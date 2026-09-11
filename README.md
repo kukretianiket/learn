@@ -2,7 +2,7 @@
 
 [![video](assets/thumbnail.png)](https://www.youtube.com/watch?v=kzcI5F4tGiU)
 
-Amos Blomqvist's AI learning system from [How I Use AI to Learn Things](https://www.youtube.com/watch?v=kzcI5F4tGiU), along with a separate Codex + Obsidian implementation. The original Pi files are preserved; the Codex version lives beside them.
+amosblomqvist's AI learning system from [How I Use AI to Learn Things](https://www.youtube.com/watch?v=kzcI5F4tGiU), along with a separate Codex + Obsidian implementation. The original Pi files are preserved; the Codex version lives beside them.
 
 See [BUG_HISTORY.md](BUG_HISTORY.md) for known issues, fixes, and remaining limitations.
 
@@ -31,9 +31,12 @@ This version provides stateful lessons in Codex and mirrors the conversation int
 Codex conversation
   -> $learn skill
   -> UserPromptSubmit + Stop hooks
-  -> Learning/Sessions/*.md
-  -> Learning/_system state
+  -> Learning/_system/lessons/<lesson_id>.json
+  -> deterministic Learning/Sessions/*.md rendering
+  -> optional Obsidian navigation after persistence
 ```
+
+The canonical JSON record owns lesson identity, exact conversation binding, message Markdown, lifecycle, checkpoints, source usage, and assessment data. Session Markdown is a recoverable view of that record. Topic Markdown is likewise derived from durable topic baselines plus lesson/review assessments. Routine hooks make no model calls and return no transcript to model context.
 
 ### Install
 
@@ -90,25 +93,30 @@ Useful commands:
 python3 ~/.agents/skills/learn/scripts/learnctl.py status
 python3 ~/.agents/skills/learn/scripts/learnctl.py due
 python3 ~/.agents/skills/learn/scripts/learnctl.py review --topic gradient --score 2
+python3 ~/.agents/skills/learn/scripts/learnctl.py pause --session-id <conversation-id>
+python3 ~/.agents/skills/learn/scripts/learnctl.py resume --lesson-id <lesson-uuid>
+python3 ~/.agents/skills/learn/scripts/learnctl.py repair --lesson-id <lesson-uuid>
 python3 ~/.agents/skills/learn/scripts/learnctl.py validate
 python3 ~/.agents/skills/learn/scripts/learnctl.py doctor
 ```
 
-`cleanup` previews disposable hook state; add `--apply` only after reviewing it. It does not delete lesson notes or durable learning state.
+`cleanup` previews disposable pending and stale-binding state; add `--apply` only after reviewing it. It does not delete lesson notes or durable learning state.
 
 ### Notes, sources, and privacy
 
-Session notes, topic state, review history, and source records stay inside the configured `Learning` folder. Each source used in a lesson is recorded under `Learning/Sources`; only verified or user-provided sources may support factual claims.
+Session notes, canonical lessons, topic state, durable review assessments, and source records stay inside the configured `Learning` folder. `lesson_id` identifies one immutable lesson, `session_id` is the exact Codex conversation attachment, and `turn_id` is the runtime turn identity. Each source used in a lesson is recorded under `Learning/Sources`; only verified or user-provided sources may support factual claims.
 
 Hooks log only user and final assistant text. They do not record tool calls, shell output, search traces, internal reasoning, or system messages. Existing notes outside `Learning` are untouched, and content outside managed regions in topic notes is preserved.
 
 ### Troubleshooting
 
-- **No pending Codex prompt:** Restart Codex after installing and trusting the hooks, then invoke `$learn` again.
+- **No pending Codex prompt:** The conversation ID resolved, but Learn has no captured initiating prompt. New lessons accept a leading `$learn` token or the IDE's linked form `[$learn](.../learn/SKILL.md)`; quoted examples and mentions later in prose do not activate logging. Versions before the IDE-link fix silently rejected linked invocations. After updating the hook script, submit a fresh explicit invocation; rerunning `start` alone cannot recreate an uncaptured prompt. If it still fails, verify that `UserPromptSubmit` and `Stop` are enabled and trusted in the failing Codex runtime and use the intended configuration. `doctor` checks configured files, not actual hook delivery.
 - **Note does not open:** Run `learnctl doctor`. If needed, re-enable opening with `learnctl configure --vault "/path/to/vault" --open-notes`.
 - **Windows do not tile:** Confirm `window_layout` is `desktop-split` and grant macOS Accessibility permission to the app hosting Codex.
 - **Vault write failure:** Add the vault's absolute path to the active Codex writable roots.
 - **Interrupted lesson:** Invoke `$learn` again in the same Codex session.
+- **Paused lesson:** Explicitly select it with `learnctl resume --lesson-id <lesson-uuid>` from the new conversation.
+- **Stale generated Markdown:** Run `learnctl repair --lesson-id <lesson-uuid>`; canonical messages remain durable.
 - **Abandoned lesson:** Run `learnctl abort --session-id <id>`; the note is retained.
 - **Validation failure:** Run `learnctl validate` for the exact failing file or invariant.
 

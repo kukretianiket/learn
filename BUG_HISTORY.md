@@ -81,8 +81,8 @@ This document records defects and design failures encountered while building and
 
 - **Observed:** All or most diagnostic answers appeared at option A, allowing position recognition to replace subject knowledge.
 - **Cause:** The language model generated substantive choices and labels together. LLM output is not a reliable randomness source and showed a strong positional habit.
-- **Correction:** The model must draft unlabeled choices first, then request correct positions from `learnctl context --next-mcq`. The utility uses `secrets.SystemRandom`, outside the model, and stores one immutable issuance per Codex turn.
-- **Verification:** Tests patch the entropy source, verify the selected labels, verify one draw per turn, and verify isolation between Codex sessions.
+- **Correction:** The model must draft unlabeled choices first, then request correct positions from `learnctl context --next-mcq` with a stable semantic question ID. The utility uses `secrets.SystemRandom`, outside the model, and stores one immutable issuance per question; retries cannot reroll it.
+- **Verification:** Tests patch the entropy source, verify the selected labels, verify one draw per stable question ID, and verify isolation between Codex sessions.
 - **Residual constraint:** Operating-system randomness controls labels, not the semantic quality of model-written distractors.
 
 ### B-08 — The first MCQ fix leaked a new pattern
@@ -164,10 +164,10 @@ This document records defects and design failures encountered while building and
 ### B-18 — `_system` grew without cleanup semantics
 
 - **Observed:** `_system` quickly filled with event hashes, pending records, and stale active records. At one inspection it contained 52 event files, 17 pending records, and nine active records; several active records pointed to missing test/retry notes and caused validation failures.
-- **Cause:** Event records are one-per-role-per-turn deduplication markers, pending records are one-per-Codex-session association records, and no command defined their lifecycle. Interrupted GUI/E2E attempts also left orphan active state.
-- **Correction:** `learnctl cleanup` now performs a dry run by default and requires `--apply` to delete. It removes inactive events, expired inactive pending prompts, pending records tied to orphan state, orphan/completed/aborted active records, invalid disposable records, and Finder metadata. It never removes lesson notes, topic/source state, rendered notes, or assets.
-- **Verification:** Cleanup tests cover dry-run behavior, apply behavior, active-session protection, stale state, retention, and preservation of durable content.
-- **Implementation correction caught before release:** An early cleanup rule considered deleting pending records once a session was active. `context --next-mcq` still needs the active session's latest pending record to bind answer-position issuance to the current turn. The final rule protects both pending and event records for every live session.
+- **Cause:** The earlier design created one sidecar file per role and turn even though canonical lesson records already owned message identity. Pending records also lacked a defined lifecycle, and interrupted GUI/E2E attempts left orphan active state.
+- **Correction:** Event sidecars and their directory were removed. Canonical lesson messages now own deduplication identities exclusively. `learnctl cleanup` remains a dry run by default and requires `--apply`; it handles only disposable pending records, stale bindings, and Finder metadata while preserving durable lesson, review, topic, source, note, and asset data.
+- **Verification:** Cleanup tests cover dry-run behavior, apply behavior, active-session protection, stale state, retention, and preservation of durable content. Hook tests verify canonical replay deduplication without sidecars.
+- **Implementation correction caught before release:** An early cleanup rule considered deleting pending records once a session was active. `context --next-mcq` still needs the active session's latest pending record to bind answer-position issuance to the current turn. The final rule protects pending records for every live session.
 
 ### B-19 — Review scheduling crossed the UTC/local-date boundary
 
@@ -180,14 +180,14 @@ This document records defects and design failures encountered while building and
 
 - **Observed:** Documentation initially called the Codex `session_id` the unique identifier of a learning session without qualification.
 - **Cause:** Active-state identity and durable lesson-record identity were conflated. One Codex conversation has one active Learn note at a time, but it can run multiple lessons sequentially with the same Codex `session_id`.
-- **Correction:** Documentation now calls `session_id` the authoritative active-session and hook-isolation key. New session notes store the full value in frontmatter. The session-note path identifies a particular durable lesson record; the short filename hash is not the full ID.
-- **Verification:** Session tests confirm that new note frontmatter contains the exact Codex session ID.
+- **Correction:** Documentation now distinguishes the immutable local `lesson_id`, exact runtime `session_id`, and exact runtime `turn_id`. New session notes store lesson and conversation identifiers in frontmatter; the session-note path and short filename suffix replace neither.
+- **Verification:** Canonical storage tests confirm UUID lesson identity, exact conversation binding, and exact hook turn isolation.
 
 ## Behavior clarifications that were not defects
 
 ### C-01 — Pausing a lesson
 
-There is no separate paused state. Stopping the conversation leaves the active record intact, which is the pause mechanism. Invoking `$learn` again in the same Codex conversation resumes the existing note. `abort` means abandonment, not pause, and preserves the note while removing active state.
+Learn now has an explicit `paused` state. `pause` preserves the lesson and detaches it so unrelated conversation is not logged. `resume` requires a selected lesson UUID and refuses to steal an attachment from another conversation. `abort` remains abandonment and preserves the record and note.
 
 ### C-02 — Obsidian already being open
 
@@ -208,13 +208,13 @@ These are current boundaries, not claims of completed fixes:
 5. Diagnostic stopping remains model-executed policy rather than deterministic state tracked by `learnctl`.
 6. Distractor semantics remain model-generated even though answer positions use operating-system randomness.
 7. User-visible assistant process narration is logged because the hook must preserve raw assistant messages; prevention belongs in the skill behavior.
-8. The bundled skill-package validator imports PyYAML. It cannot run in this dependency-free project without an external package, so the current validation fallback is the standard-library unit suite, Python compilation, diff checks, and manual frontmatter/placeholder checks.
+8. PyYAML is installed only in the ignored development virtual environment for the bundled skill-package validator. Learn itself remains standard-library-only.
 
 ## Current verification baseline
 
-As of 2026-09-05:
+As of 2026-09-05 after the clean canonical reset:
 
-- 52 standard-library `unittest` tests pass.
+- 98 standard-library `unittest` tests pass; the removed migration suite is preserved in the external migration archive.
 - The Python files compile successfully.
 - `git diff --check` passes.
 - Tests use temporary HOME and vault directories.
