@@ -1,6 +1,6 @@
 # learn
 
-[![video](assets/thumbnail.png)](https://www.youtube.com/watch?v=kzcI5F4tGiU)
+[![video](assets/thumbnail_codex.png)](https://www.youtube.com/watch?v=kzcI5F4tGiU)
 
 amosblomqvist's AI learning system from [How I Use AI to Learn Things](https://www.youtube.com/watch?v=kzcI5F4tGiU), along with a separate Codex + Obsidian implementation. The original Pi files are preserved under [pi/](pi/README.md).
 
