@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 import uuid
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -40,6 +41,15 @@ REVIEW_SCHEMA_VERSION = 1
 DEFAULT_CONTEXT_MESSAGES = 8
 MAX_CONTEXT_MESSAGES = 50
 MAX_CHECKPOINT_BYTES = 16 * 1024
+REFERENCE_BUNDLE_VERSION = 1
+REFERENCE_ORDER = (
+    "pedagogy.md",
+    "rendering.md",
+    "source-policy.md",
+    "evidence-model.md",
+    "state-schemas.md",
+)
+DISPLAY_RETRY_DELAYS = (0.15, 0.3, 0.6, 1.0, 1.5)
 LESSON_STATES = {"active", "paused", "finishing", "completed", "aborted"}
 OPTIONAL_FINISH_KEYS = {"reassessment", "contrary_evidence_refs"}
 SEMANTIC_REVIEW_KEYS = {
@@ -117,6 +127,38 @@ class EventConflictError(LearnError):
 
 class SavedRenderingError(LearnError):
     pass
+
+
+def instruction_bundle() -> dict:
+    """Return the complete, content-addressed reference contract for this model context."""
+    reference_root = Path(__file__).resolve().parent.parent / "references"
+    files = []
+    fingerprint = hashlib.sha256()
+    for filename in REFERENCE_ORDER:
+        path = reference_root / filename
+        if not path.is_file():
+            raise LearnError(f"Required Learn reference is missing: {path}")
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise LearnError(f"Required Learn reference could not be read: {path}: {exc}") from exc
+        relative = f"references/{filename}"
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        fingerprint.update(relative.encode("utf-8"))
+        fingerprint.update(b"\0")
+        fingerprint.update(content.encode("utf-8"))
+        fingerprint.update(b"\0")
+        files.append({"filename": relative, "sha256": digest, "content": content})
+    return {
+        "version": REFERENCE_BUNDLE_VERSION,
+        "fingerprint": f"sha256:{fingerprint.hexdigest()}",
+        "files": files,
+        "instruction": (
+            "Read all five files in order before the first teaching response. Reuse this bundle for the "
+            "uninterrupted conversation; request start or resume recovery again only when it is no longer in context. "
+            "The fingerprint identifies supplied bytes and does not prove comprehension."
+        ),
+    }
 
 
 def now_utc() -> dt.datetime:
@@ -262,6 +304,19 @@ def state_lock(config: dict):
     ensure_layout(config)
     lock_path = system_root(config) / ".learnctl.lock"
     with lock_path.open("a+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def navigation_lock(config: dict):
+    if fcntl is None:
+        raise LearnError("Process locking is unavailable; refusing overlapping Obsidian navigation")
+    ensure_layout(config)
+    with (system_root(config) / ".navigation.lock").open("a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
@@ -556,10 +611,19 @@ def update_frontmatter_fields(text: str, updates: dict[str, str], label: str) ->
 
 def default_operational_state() -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "last_successful_capture": None,
         "pending_rendering_repairs": [],
         "last_error": None,
+        "latest_requested_message": None,
+        "last_successfully_displayed_message": None,
+        "pending_display": None,
+        "pending_displays": {},
+        "latest_requested_by_session": {},
+        "display_failures": {},
+        "failed_stage": None,
+        "diagnostic": None,
+        "last_response_validation": None,
     }
 
 
@@ -569,8 +633,12 @@ def read_operational_state(config: dict) -> dict:
         return default_operational_state()
     result = default_operational_state()
     result.update(state)
+    result["schema_version"] = 2
     if not isinstance(result.get("pending_rendering_repairs"), list):
         result["pending_rendering_repairs"] = []
+    for key in ("pending_displays", "latest_requested_by_session", "display_failures"):
+        if not isinstance(result.get(key), dict):
+            result[key] = {}
     return result
 
 
@@ -589,6 +657,98 @@ def record_capture_health(
             item for item in state["pending_rendering_repairs"] if item != note_relative
         ]
     write_json(operational_path(config), state)
+
+
+def record_response_validation_locked(config: dict, lesson: dict, message_id: str, diagnostics: list[dict]) -> None:
+    state = read_operational_state(config)
+    state["last_response_validation"] = {
+        "at": iso_now(),
+        "lesson_id": lesson["lesson_id"],
+        "session_id": active_session_id(lesson),
+        "message_id": message_id,
+        "status": "failed" if diagnostics else "passed",
+        "diagnostics": diagnostics[:20],
+    }
+    write_json(operational_path(config), state)
+
+
+def record_display_requested_locked(config: dict, lesson: dict, message_id: str) -> None:
+    request = {
+        "at": iso_now(),
+        "lesson_id": lesson["lesson_id"],
+        "session_id": active_session_id(lesson),
+        "message_id": message_id,
+        "attempts": 0,
+    }
+    state = read_operational_state(config)
+    state["latest_requested_message"] = dict(request)
+    state["pending_display"] = request
+    state["pending_displays"][active_session_id(lesson)] = request
+    state["latest_requested_by_session"][active_session_id(lesson)] = dict(request)
+    state["failed_stage"] = None
+    state["diagnostic"] = None
+    write_json(operational_path(config), state)
+
+
+def record_display_result(config: dict, request: dict, result: dict) -> None:
+    with state_lock(config):
+        state = read_operational_state(config)
+        session_id = str(request.get("session_id") or "")
+        pending_for_session = state.get("pending_displays", {}).get(session_id) or {}
+        if pending_for_session.get("message_id") != request.get("message_id"):
+            return
+        pending = dict(pending_for_session)
+        pending["attempts"] = int(pending.get("attempts", 0)) + 1
+        if result.get("status") == "verified":
+            state["last_successfully_displayed_message"] = {
+                **{key: request.get(key) for key in ("lesson_id", "session_id", "message_id")},
+                "at": iso_now(),
+            }
+            state["pending_displays"].pop(session_id, None)
+            state["display_failures"].pop(session_id, None)
+            if (state.get("latest_requested_message") or {}).get("message_id") == request.get("message_id"):
+                state["pending_display"] = None
+                state["failed_stage"] = None
+                state["diagnostic"] = None
+            if (
+                (state.get("last_error") or {}).get("operation") == "gui-follow"
+                and (state.get("last_error") or {}).get("session_id") == session_id
+            ):
+                state["last_error"] = None
+        else:
+            note_result = result.get("note_open") or result.get("readiness") or result
+            state["pending_displays"][session_id] = pending
+            failure = {
+                "message_id": request.get("message_id"),
+                "failed_stage": note_result.get("stage") or "display",
+                "diagnostic": str(note_result.get("diagnostic") or "Obsidian display was not verified")[:500],
+                "attempts": pending["attempts"],
+            }
+            state["display_failures"][session_id] = failure
+            if (state.get("latest_requested_message") or {}).get("message_id") == request.get("message_id"):
+                state["pending_display"] = pending
+                state["failed_stage"] = failure["failed_stage"]
+                state["diagnostic"] = failure["diagnostic"]
+            state["last_error"] = {
+                "at": iso_now(),
+                "operation": "gui-follow",
+                "error_type": "DisplayVerificationError",
+                "event": "Stop",
+                "session_id": request.get("session_id"),
+                "turn_id": None,
+            }
+        write_json(operational_path(config), state)
+
+
+def unresolved_response_diagnostics(config: dict, lesson: dict) -> list[dict] | None:
+    validation = read_operational_state(config).get("last_response_validation")
+    if (
+        isinstance(validation, dict)
+        and validation.get("lesson_id") == lesson.get("lesson_id")
+        and validation.get("status") == "failed"
+    ):
+        return list(validation.get("diagnostics") or [])
+    return None
 
 
 def record_operational_error(
@@ -687,7 +847,8 @@ def render_transcript(lesson: dict) -> str:
         label = "Learner" if message["role"] == "user" else "Tutor"
         icon = "🧑" if message["role"] == "user" else "🤖"
         heading = f"{icon} {label} · {message['captured_at']}"
-        blocks.append(f"---\n\n### {heading}\n\n{message['markdown'].rstrip()}\n")
+        anchor = f"learn-message-{message['message_id']}"
+        blocks.append(f'---\n\n<span id="{anchor}"></span>\n\n### {heading}\n\n{message["markdown"].rstrip()}\n')
     return "\n" + "\n".join(blocks).rstrip() + "\n"
 
 
@@ -767,10 +928,7 @@ def render_lesson_note(config: dict, lesson: dict) -> tuple[Path, str | None]:
     )
     atomic_write(note, text)
     tutor = [message for message in lesson["messages"] if message["role"] == "assistant"]
-    heading = None
-    if tutor:
-        heading = f"🤖 Tutor · {tutor[-1]['captured_at']}"
-    return note, heading
+    return note, (str(tutor[-1]["message_id"]) if tutor else None)
 
 
 def capture_lesson_message(
@@ -792,8 +950,8 @@ def capture_lesson_message(
             continue
         if existing["markdown"] != markdown:
             raise EventConflictError("Conflicting replay for an existing hook event identity")
-        note, heading = render_lesson_note(config, lesson)
-        return lesson, False, note, heading
+        note, _ = render_lesson_note(config, lesson)
+        return lesson, False, note, str(existing["message_id"])
     captured_at = iso_now()
     lesson["messages"].append(
         {
@@ -872,6 +1030,43 @@ def is_explicit_learn_activation(prompt: str) -> bool:
     return "://" not in target and re.search(r"(?:^|[/\\])learn[/\\]SKILL\.md$", target) is not None
 
 
+def attempt_pending_display(config: dict, session_id: str) -> dict | None:
+    """Retry only the newest queued display request, serialized across hook processes."""
+    with navigation_lock(config):
+        with state_lock(config):
+            state = read_operational_state(config)
+            request = state.get("pending_displays", {}).get(session_id)
+            latest = state.get("latest_requested_by_session", {}).get(session_id) or {}
+            if (
+                not isinstance(request, dict)
+                or request.get("session_id") != session_id
+                or request.get("message_id") != latest.get("message_id")
+            ):
+                return None
+            try:
+                lesson = load_lesson(config, str(request.get("lesson_id") or ""))
+                note = lesson_note_path(config, lesson)
+            except LearnError as exc:
+                result = {
+                    "status": "failed",
+                    "note_open": {"status": "failed", "stage": "select-note", "diagnostic": str(exc)},
+                }
+                lesson = None
+                note = None
+        if lesson is None or note is None:
+            record_display_result(config, request, result)
+            return result
+        try:
+            result = follow_lesson_output(config, note, lesson, str(request["message_id"]))
+        except (LearnError, OSError, subprocess.SubprocessError) as exc:
+            result = {
+                "status": "failed",
+                "note_open": {"status": "failed", "stage": "display", "diagnostic": str(exc)},
+            }
+        record_display_result(config, request, result)
+        return result
+
+
 def run_hook(data: dict) -> None:
     """Handle a Codex hook. Caller intentionally suppresses all output/errors."""
     config = load_config(required=False)
@@ -884,7 +1079,8 @@ def run_hook(data: dict) -> None:
     if not event or not session_id or not turn_id:
         return
 
-    follow_request = None
+    should_retry_display = False
+    validation_request = None
     with state_lock(config):
         if event == "UserPromptSubmit":
             prompt = data.get("prompt")
@@ -922,48 +1118,57 @@ def run_hook(data: dict) -> None:
                 turn_id,
                 rendered_note,
             )
-            return
-
-        active = read_active(config, session_id)
-        if not active:
-            return
-        message = data.get("last_assistant_message")
-        if not isinstance(message, str) or not message:
-            return
-        rendered_note = None
-        if active.get("status") == "finishing":
-            expected = active.get("expected_finishing") or {}
-            if expected.get("session_id") != session_id or expected.get("turn_id") != turn_id:
+            should_retry_display = canonical_logging
+        else:
+            active = read_active(config, session_id)
+            if not active:
                 return
-        elif active.get("status") != "active":
-            return
-        active, stored, note, heading = capture_lesson_message(config, data, "assistant", message)
-        if stored is None:
-            return
-        if stored:
-            follow_request = (note, dict(active), heading)
-        rendered_note = str(active["note_relative"])
-        if active.get("status") == "finishing":
-            active["status"] = "completed"
-            active["completed_at"] = iso_now()
-            active["conversation_binding"]["detached_at"] = active["completed_at"]
-            save_lesson(config, active)
-            render_error = None
-            try:
-                note, _ = render_lesson_note(config, active)
-            except (LearnError, OSError) as exc:
-                mark_rendering_repair_locked(config, active, "complete-render", exc, turn_id)
-                render_error = exc
-            active_path(config, session_id).unlink(missing_ok=True)
-            if render_error:
-                raise SavedRenderingError("Final response was saved and lesson completed; rendering needs repair") from render_error
-        record_capture_health(config, event, session_id, turn_id, rendered_note)
-    if follow_request and config.get("open_notes_automatically"):
-        note, active, heading = follow_request
-        try:
-            follow_lesson_output(config, note, active, heading)
-        except (LearnError, OSError, subprocess.SubprocessError) as exc:
-            record_operational_error(config, data, "gui-follow", exc, needs_rendering_repair=False)
+            message = data.get("last_assistant_message")
+            if not isinstance(message, str) or not message:
+                return
+            rendered_note = None
+            if active.get("status") == "finishing":
+                expected = active.get("expected_finishing") or {}
+                if expected.get("session_id") != session_id or expected.get("turn_id") != turn_id:
+                    return
+            elif active.get("status") != "active":
+                return
+            active, stored, note, message_id = capture_lesson_message(config, data, "assistant", message)
+            if stored is None:
+                return
+            rendered_note = str(active["note_relative"])
+            if stored:
+                diagnostics = structural_response_diagnostics(message)
+                record_response_validation_locked(config, active, str(message_id), diagnostics)
+                record_display_requested_locked(config, active, str(message_id))
+                validation_request = (dict(active), str(message_id), message)
+            should_retry_display = True
+            if active.get("status") == "finishing":
+                active["status"] = "completed"
+                active["completed_at"] = iso_now()
+                active["conversation_binding"]["detached_at"] = active["completed_at"]
+                save_lesson(config, active)
+                render_error = None
+                try:
+                    note, _ = render_lesson_note(config, active)
+                except (LearnError, OSError) as exc:
+                    mark_rendering_repair_locked(config, active, "complete-render", exc, turn_id)
+                    render_error = exc
+                active_path(config, session_id).unlink(missing_ok=True)
+                if render_error:
+                    raise SavedRenderingError("Final response was saved and lesson completed; rendering needs repair") from render_error
+            record_capture_health(config, event, session_id, turn_id, rendered_note)
+    gui_allowed = config.get("open_notes_automatically") and not opening_needs_escalation(config)
+    if should_retry_display and gui_allowed:
+        attempt_pending_display(config, session_id)
+    if validation_request and gui_allowed:
+        active, message_id, message = validation_request
+        mathjax = ObsidianAdapter(config).validate_mathjax(collect_math_expressions(message))
+        if mathjax.get("status") == "failed":
+            with state_lock(config):
+                record_response_validation_locked(
+                    config, active, message_id, structural_response_diagnostics(message, mathjax)
+                )
 
 
 def pending_for_session(config: dict, session_id: str | None = None) -> dict:
@@ -990,6 +1195,15 @@ def find_related_topic(config: dict, title: str) -> dict | None:
         if needle and needle in {normalized_topic(str(name)) for name in names}:
             return record
     return None
+
+
+def paused_lessons_for_topic(config: dict, topic_id: str) -> list[dict]:
+    matches = []
+    for path in (system_root(config) / "lessons").glob("*.json"):
+        lesson = load_lesson(config, path.stem)
+        if lesson["status"] == "paused" and active_topic_id(lesson) == topic_id:
+            matches.append(lesson)
+    return sorted(matches, key=lambda lesson: (lesson.get("created_at", ""), lesson["lesson_id"]))
 
 
 def new_topic(title: str, slug: str) -> dict:
@@ -1144,136 +1358,303 @@ def render_session_template(
     return text
 
 
-def obsidian_uri(config: dict, note_path: Path, heading: str | None = None) -> str:
+def obsidian_uri(config: dict, note_path: Path) -> str:
     vault = config.get("obsidian_vault_name")
-    suffix = f"#{heading}" if heading else ""
     if vault:
         relative = note_path.resolve().relative_to(Path(config["vault_path"]).resolve()).as_posix()
-        return "obsidian://open?vault=" + quote(str(vault), safe="") + "&file=" + quote(relative + suffix, safe="")
-    return "obsidian://open?path=" + quote(str(note_path.resolve()) + suffix, safe="")
+        return "obsidian://open?vault=" + quote(str(vault), safe="") + "&file=" + quote(relative, safe="")
+    return "obsidian://open?path=" + quote(str(note_path.resolve()), safe="")
 
 
-def open_note(config: dict, note_path: Path, heading: str | None = None) -> str:
-    cli = shutil.which("obsidian")
-    if cli:
-        relative = note_path.resolve().relative_to(Path(config["vault_path"]).resolve()).as_posix()
-        if heading:
-            relative += f"#{heading}"
-        command = [cli]
-        if config.get("obsidian_vault_name"):
-            command.append(f"vault={config['obsidian_vault_name']}")
-        command.extend(["open", f"path={relative}"])
+def latest_tutor_message_id(note: Path) -> str | None:
+    anchors = re.findall(
+        r'(?m)^<span id="learn-message-([0-9a-f]{64})"></span>\n\n### 🤖 Tutor · ',
+        note.read_text(encoding="utf-8"),
+    )
+    return anchors[-1] if anchors else None
+
+
+def _parse_obsidian_json(output: str) -> dict:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    for line in reversed(lines):
+        try:
+            value = json.loads(line)
+            if isinstance(value, str):
+                value = json.loads(value)
+            if isinstance(value, dict):
+                return value
+        except (json.JSONDecodeError, TypeError):
+            continue
+    raise LearnError(f"Obsidian CLI returned no JSON result: {(output.strip() or 'empty output')[:240]}")
+
+
+OBSIDIAN_VIEW_HELPER = r'''(async () => {
+  const input = JSON.parse(__INPUT__);
+  const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const file = app.vault.getAbstractFileByPath(input.path);
+  if (!file || file.extension !== "md") return JSON.stringify({status:"failed",stage:"select-note",diagnostic:"Exact Markdown file was not found in the selected vault"});
+  let leaf = app.workspace.getLeavesOfType("markdown").find(candidate => candidate.view && candidate.view.file && candidate.view.file.path === input.path);
+  if (!leaf) leaf = app.workspace.getLeaf(false);
+  await leaf.openFile(file, {active:true});
+  await leaf.setViewState({type:"markdown", state:{file:input.path, mode:"preview", source:false}, active:true});
+  app.workspace.setActiveLeaf(leaf, {focus:true});
+  let stable = 0;
+  let previous = "";
+  let last = {};
+  for (let attempt = 1; attempt <= 36; attempt++) {
+    const view = leaf.view;
+    const mode = view && typeof view.getMode === "function" ? view.getMode() : null;
+    const path = view && view.file ? view.file.path : null;
+    const root = view && view.containerEl ? view.containerEl : null;
+    const anchor = input.anchor && root ? root.querySelector("#" + input.anchor) : root;
+    const pendingImages = root ? Array.from(root.querySelectorAll("img")).filter(img => !img.complete).length : 0;
+    const pendingDiagrams = root ? Array.from(root.querySelectorAll(".mermaid")).filter(el => !el.querySelector("svg")).length : 0;
+    const signature = root ? `${root.scrollHeight}|${root.querySelectorAll("img,svg,canvas").length}|${pendingImages}|${pendingDiagrams}` : "";
+    stable = signature && signature === previous && pendingImages === 0 && pendingDiagrams === 0 ? stable + 1 : 0;
+    previous = signature;
+    last = {attempt, path, mode, anchorFound:!!anchor, pendingImages, pendingDiagrams};
+    if (path === input.path && mode === "preview" && anchor && stable >= 2) {
+      if (input.anchor) anchor.scrollIntoView({block:"start", inline:"nearest"});
+      await sleep(120);
+      const pane = root.getBoundingClientRect();
+      const rect = anchor.getBoundingClientRect();
+      const visible = rect.top >= pane.top - 4 && rect.top <= pane.bottom;
+      if (visible) return JSON.stringify({status:"verified",stage:null,path,mode,anchor:input.anchor || null,visible:true,attempt});
+      last.visible = false;
+    }
+    await sleep(100);
+  }
+  return JSON.stringify({status:"failed",stage:"verify-note",diagnostic:"Exact note, Reading View, or newest response anchor did not become visible after rendering settled",state:last});
+})()'''
+
+
+OBSIDIAN_MATHJAX_HELPER = r'''(async () => {
+  const input = JSON.parse(__INPUT__);
+  const {renderMath, finishRenderMath} = require("obsidian");
+  const failures = [];
+  for (const item of input.expressions) {
+    try {
+      const element = renderMath(item.expression, item.display);
+      const error = element && element.querySelector ? element.querySelector("mjx-merror, .mjx-error") : null;
+      if (error) failures.push({line:item.line, diagnostic:(error.textContent || "MathJax rendering error").trim()});
+    } catch (error) {
+      failures.push({line:item.line, diagnostic:String(error && error.message ? error.message : error)});
+    }
+  }
+  await finishRenderMath();
+  return JSON.stringify({status:failures.length ? "failed" : "verified", failures});
+})()'''
+
+
+class ObsidianAdapter:
+    """Bounded, verified control of one vault and one Markdown pane through the native CLI."""
+
+    def __init__(self, config: dict):
+        self.config = config
+        self.vault = Path(config["vault_path"]).resolve()
+        override = str(os.environ.get("OBSIDIAN_CLI_PATH") or "").strip()
+        self.cli = (
+            override
+            if override and Path(override).is_absolute() and os.access(override, os.X_OK)
+            else shutil.which("obsidian")
+        )
+
+    def command(self, *arguments: str, timeout: float = 5) -> subprocess.CompletedProcess:
+        if not self.cli:
+            raise LearnError("Official Obsidian CLI is unavailable; enable it in Obsidian Settings → General")
+        command = [self.cli]
+        if self.config.get("obsidian_vault_name"):
+            command.append(f"vault={self.config['obsidian_vault_name']}")
+        command.extend(arguments)
+        return subprocess.run(
+            command,
+            cwd=str(self.vault),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+
+    def capabilities(self) -> dict:
+        if not self.cli:
+            return {"status": "unavailable", "diagnostic": "Official Obsidian CLI was not found on PATH"}
         try:
             result = subprocess.run(
-                command,
-                cwd=str(Path(config["vault_path"]).resolve()),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                [self.cli, "help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5, check=False
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"status": "failed", "diagnostic": str(exc)}
+        output = f"{result.stdout}\n{result.stderr}"
+        required = {name: bool(re.search(rf"(?m)(?:^|\s){re.escape(name)}(?:\s|$)", output)) for name in ("open", "eval", "vault")}
+        ok = result.returncode == 0 and all(required.values())
+        return {
+            "status": "available" if ok else "incompatible",
+            "path": self.cli,
+            "required_commands": required,
+            "diagnostic": None if ok else (output.strip() or f"help exited {result.returncode}")[:240],
+        }
+
+    def _uri_launch(self, note: Path) -> dict:
+        if sys.platform != "darwin":
+            return {"status": "failed", "method": "none", "diagnostic": "No supported launch fallback on this platform"}
+        try:
+            result = subprocess.run(
+                ["open", obsidian_uri(self.config, note)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
                 timeout=10,
                 check=False,
             )
-            if result.returncode == 0:
-                return "obsidian-cli"
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    if sys.platform == "darwin":
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"status": "failed", "method": "obsidian-uri", "diagnostic": str(exc)}
+        diagnostic = (result.stderr or result.stdout).strip()
+        if result.returncode == 0:
+            return {"status": "requested-unverified", "method": "obsidian-uri", "diagnostic": diagnostic or None}
+        return {"status": "failed", "method": "obsidian-uri", "diagnostic": diagnostic or f"exit {result.returncode}"}
+
+    def _ready(self) -> dict:
+        last = "Obsidian did not become ready"
+        for attempt, delay in enumerate((0.0,) + DISPLAY_RETRY_DELAYS, 1):
+            if delay:
+                time.sleep(delay)
+            try:
+                result = self.command("vault", "info=path", timeout=4)
+            except (LearnError, OSError, subprocess.TimeoutExpired) as exc:
+                last = str(exc)
+                continue
+            actual = (result.stdout or "").strip().splitlines()
+            actual_path = actual[-1].strip() if actual else ""
+            actual_path = re.sub(r"(?i)^path\s*(?::|\t|\s)\s*", "", actual_path)
+            try:
+                matches = Path(actual_path).expanduser().resolve() == self.vault
+            except (OSError, ValueError):
+                matches = False
+            if result.returncode == 0 and matches:
+                return {"status": "ready", "attempt": attempt, "vault_path": actual_path}
+            last = (result.stderr or result.stdout).strip() or f"vault path check exited {result.returncode}"
+        return {"status": "failed", "stage": "select-vault", "diagnostic": last[:240]}
+
+    def launch_and_open(self, note: Path, message_id: str | None = None) -> dict:
+        relative = note.resolve().relative_to(self.vault).as_posix()
+        launch = None
+        if self.cli:
+            try:
+                launched = self.command("version", timeout=8)
+                if launched.returncode == 0:
+                    launch = {"status": "launched", "method": "obsidian-cli"}
+                else:
+                    launch = {"status": "failed", "method": "obsidian-cli", "diagnostic": (launched.stderr or launched.stdout).strip()[:240]}
+            except (LearnError, OSError, subprocess.TimeoutExpired) as exc:
+                launch = {"status": "failed", "method": "obsidian-cli", "diagnostic": str(exc)}
+        if not launch or launch["status"] == "failed":
+            launch = self._uri_launch(note)
+        if not self.cli:
+            return {
+                "status": "unverified" if launch["status"] == "requested-unverified" else "failed",
+                "launch": launch,
+                "note_open": {
+                    "status": "unverified" if launch["status"] == "requested-unverified" else "failed",
+                    "stage": "verify-note",
+                    "diagnostic": "Official Obsidian CLI is unavailable, so the URI launch cannot be verified",
+                    "retry": "Enable the official Obsidian CLI, then run learnctl open again",
+                },
+            }
+        ready = self._ready()
+        if ready["status"] != "ready":
+            return {"status": "failed", "launch": launch, "readiness": ready, "note_open": ready}
+        if launch.get("status") == "requested-unverified":
+            launch = {**launch, "status": "verified-ready"}
         try:
-            result = subprocess.run(
-                ["open", obsidian_uri(config, note_path, heading)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-                check=False,
-            )
-            if result.returncode == 0:
-                return "obsidian-uri"
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    return "not-opened"
+            opened = self.command("open", f"path={relative}", timeout=8)
+        except (LearnError, OSError, subprocess.TimeoutExpired) as exc:
+            opened = None
+            open_diagnostic = str(exc)
+        else:
+            open_diagnostic = (opened.stderr or opened.stdout).strip()
+        if opened is None or opened.returncode != 0:
+            note_open = {"status": "failed", "stage": "open-note", "diagnostic": open_diagnostic[:240]}
+            return {"status": "failed", "launch": launch, "readiness": ready, "note_open": note_open}
+        payload = {"path": relative, "anchor": f"learn-message-{message_id}" if message_id else None}
+        code = OBSIDIAN_VIEW_HELPER.replace("__INPUT__", json.dumps(json.dumps(payload, ensure_ascii=False)))
+        try:
+            verified = self.command("eval", f"code={code}", timeout=12)
+            note_open = _parse_obsidian_json(verified.stdout) if verified.returncode == 0 else {
+                "status": "failed", "stage": "verify-note", "diagnostic": (verified.stderr or verified.stdout).strip()[:240]
+            }
+        except (LearnError, OSError, subprocess.TimeoutExpired) as exc:
+            note_open = {"status": "failed", "stage": "verify-note", "diagnostic": str(exc)}
+        return {
+            "status": "verified" if note_open.get("status") == "verified" else "failed",
+            "launch": launch,
+            "readiness": ready,
+            "note_open": note_open,
+        }
+
+    def validate_mathjax(self, expressions: list[dict]) -> dict:
+        if not self.cli:
+            return {"status": "unavailable", "failures": []}
+        payload = {"expressions": expressions}
+        code = OBSIDIAN_MATHJAX_HELPER.replace("__INPUT__", json.dumps(json.dumps(payload, ensure_ascii=False)))
+        try:
+            result = self.command("eval", f"code={code}", timeout=10)
+            if result.returncode != 0:
+                return {"status": "unavailable", "failures": [], "diagnostic": (result.stderr or result.stdout).strip()[:240]}
+            return _parse_obsidian_json(result.stdout)
+        except (LearnError, OSError, subprocess.TimeoutExpired) as exc:
+            return {"status": "unavailable", "failures": [], "diagnostic": str(exc)}
 
 
-def latest_tutor_heading(note: Path) -> str | None:
-    headings = re.findall(r"(?m)^### (🤖 Tutor · .+)$", note.read_text(encoding="utf-8"))
-    return headings[-1] if headings else None
-
-
-def force_obsidian_reading_view(host_bundle_id: str | None, terminal_tty: str | None = None) -> dict:
-    if sys.platform != "darwin":
-        return {"status": "unsupported"}
-    if host_bundle_id and not re.fullmatch(r"[A-Za-z0-9._-]+", host_bundle_id):
-        host_bundle_id = None
-    host_literal = json.dumps(host_bundle_id) if host_bundle_id else None
-    restore = ""
+def restore_codex_focus(host_bundle_id: str | None, terminal_tty: str | None = None) -> dict:
+    if sys.platform != "darwin" or not host_bundle_id:
+        return {"status": "unsupported" if sys.platform != "darwin" else "host-not-found"}
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", host_bundle_id):
+        return {"status": "host-not-found"}
     if host_bundle_id == "com.apple.Terminal":
-        restore = r'''
+        script = r'''on run argv
 tell application id "com.apple.Terminal"
   if (count of windows) > 0 then
     set targetTTY to item 1 of argv
     set hostWindow to front window
-    if targetTTY is not "" then
-      set foundWindow to false
-      repeat with candidateWindow in windows
-        repeat with candidateTab in tabs of candidateWindow
-          if tty of candidateTab is targetTTY then
-            set hostWindow to contents of candidateWindow
-            set foundWindow to true
-            exit repeat
-          end if
-        end repeat
-        if foundWindow then exit repeat
+    repeat with candidateWindow in windows
+      repeat with candidateTab in tabs of candidateWindow
+        if targetTTY is not "" and tty of candidateTab is targetTTY then set hostWindow to contents of candidateWindow
       end repeat
-    end if
+    end repeat
     try
       set index of hostWindow to 1
     end try
     activate
   end if
-end tell'''
-    elif host_literal:
-        restore = f"tell application id {host_literal} to activate"
-    script = r'''on run argv
-tell application id "md.obsidian" to activate
-delay 0.35
-tell application "System Events"
-  try
-    set obsidianProcess to first application process whose bundle identifier is "md.obsidian"
-    tell menu 1 of menu bar item "View" of menu bar 1 of obsidianProcess
-      if exists menu item "Reading View" then click menu item "Reading View"
-    end tell
-  on error errorMessage
-    return "LEARN_READING_VIEW_FAILED|" & errorMessage
-  end try
 end tell
-delay 0.15
-__RESTORE_HOST__
 return "OK"
-end run'''.replace("__RESTORE_HOST__", restore)
+end run'''
+        arguments = [terminal_tty or ""]
+    else:
+        script = f'tell application id {json.dumps(host_bundle_id)} to activate\nreturn "OK"'
+        arguments = []
     try:
-        result = run_osascript(script, [terminal_tty or ""])
+        result = run_osascript(script, arguments)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return {"status": "failed", "message": str(exc)}
+        return {"status": "failed", "diagnostic": str(exc)}
     output = (result.stdout or result.stderr).strip()
-    if result.returncode != 0 or output != "OK":
-        return {"status": "failed", "message": output or "Could not select Obsidian Reading View"}
-    return {"status": "reading", "focus_restored": bool(host_bundle_id)}
+    return {"status": "restored" if result.returncode == 0 and output == "OK" else "failed", "diagnostic": None if output == "OK" else output}
 
 
-def follow_lesson_output(config: dict, note: Path, active: dict, heading: str | None = None) -> dict:
-    opened = open_note(config, note, heading or latest_tutor_heading(note))
-    if opened == "not-opened":
-        return {"status": "not-opened"}
+def follow_lesson_output(config: dict, note: Path, active: dict, message_id: str | None = None) -> dict:
     host_bundle_id = active.get("codex_host_bundle_id") or detect_codex_host_bundle_id()
     terminal_tty = detect_ancestor_tty() if host_bundle_id == "com.apple.Terminal" else None
-    view = force_obsidian_reading_view(host_bundle_id, terminal_tty)
-    return {"status": "followed", "opened": opened, "view": view}
+    try:
+        return ObsidianAdapter(config).launch_and_open(note, message_id or latest_tutor_message_id(note))
+    finally:
+        restore_codex_focus(host_bundle_id, terminal_tty)
 
 
 def opening_needs_escalation(config: dict | None = None) -> bool:
     """Return true when macOS GUI launch is known to be outside the active Codex sandbox."""
-    if sys.platform != "darwin" or not os.environ.get("CODEX_SANDBOX"):
-        return False
-    layout_needs_accessibility = bool(config and config.get("window_layout") == "desktop-split")
-    return layout_needs_accessibility or not shutil.which("obsidian")
+    del config
+    return sys.platform == "darwin" and bool(os.environ.get("CODEX_SANDBOX"))
 
 
 def detect_codex_host_bundle_id(environ: dict | None = None) -> str | None:
@@ -1691,6 +2072,7 @@ def command_configure(args) -> dict:
 
 
 def command_start(args) -> dict:
+    bundle = instruction_bundle()
     config = load_config()
     ensure_layout(config)
     session_id = exact_runtime_session_id(args.session_id)
@@ -1721,6 +2103,18 @@ def command_start(args) -> dict:
             if related:
                 topic = related
                 slug = topic["slug"]
+                paused = paused_lessons_for_topic(config, slug)
+                if paused:
+                    lesson_ids = ", ".join(lesson["lesson_id"] for lesson in paused)
+                    if len(paused) == 1:
+                        raise LearnError(
+                            f"Paused lesson {lesson_ids} already exists for topic {slug}; "
+                            f"resume it with resume --lesson-id {lesson_ids}"
+                        )
+                    raise LearnError(
+                        f"Multiple paused lessons exist for topic {slug}; choose one with "
+                        f"resume --lesson-id UUID. Candidates: {lesson_ids}"
+                    )
                 starting = f"Existing state: {topic['state']}. Use saved abilities, gaps, and review history before probing."
             else:
                 slug = slugify(args.title)
@@ -1805,25 +2199,38 @@ def command_start(args) -> dict:
                     "next_review": topic.get("review", {}).get("next_review"),
                 },
             }
-    opened = "disabled"
-    layout = {"status": "disabled"}
-    view = {"status": "disabled"}
+    opening = {
+        "status": "disabled",
+        "launch": {"status": "disabled"},
+        "note_open": {"status": "disabled"},
+    }
     if config["open_notes_automatically"]:
         if opening_needs_escalation(config):
-            opened = "approval-required"
-            if config.get("window_layout") == "desktop-split":
-                layout = {"status": "approval-required", "reason": "codex-sandbox"}
-            view = {"status": "approval-required", "reason": "codex-sandbox"}
+            opening = {
+                "status": "approval-required",
+                "launch": {"status": "approval-required", "reason": "codex-sandbox"},
+                "note_open": {"status": "approval-required", "reason": "codex-sandbox"},
+            }
         else:
-            opened = open_note(config, note, latest_tutor_heading(note))
-            if opened != "not-opened":
-                host_bundle_id = current_active.get("codex_host_bundle_id") or detect_codex_host_bundle_id()
-                terminal_tty = detect_ancestor_tty() if host_bundle_id == "com.apple.Terminal" else None
-                view = force_obsidian_reading_view(host_bundle_id, terminal_tty)
-                layout = apply_window_layout(config, current_active)
-    response["opened"] = opened
-    response["layout"] = layout
-    response["view"] = view
+            message_id = latest_tutor_message_id(note)
+            if message_id:
+                with state_lock(config):
+                    record_display_requested_locked(config, current_active, message_id)
+                opening = attempt_pending_display(config, session_id) or {
+                    "status": "failed",
+                    "note_open": {"status": "failed", "stage": "display", "diagnostic": "Display request was superseded"},
+                }
+            else:
+                opening = follow_lesson_output(config, note, current_active, None)
+    response["opened"] = opening["status"]
+    response["launch"] = opening.get("launch", {"status": opening["status"]})
+    response["note_open"] = opening.get("note_open", {"status": opening["status"]})
+    response["layout"] = {"status": "not-requested", "instruction": "Run learnctl layout explicitly if desired."}
+    response["view"] = response["note_open"]
+    response["instruction_bundle"] = bundle
+    diagnostics = unresolved_response_diagnostics(config, current_active)
+    if diagnostics:
+        response["response_diagnostics"] = diagnostics
     return response
 
 
@@ -2173,20 +2580,34 @@ def command_open(args) -> dict:
     note = lesson_note_path(config, active)
     if not note.is_file():
         raise LearnError(f"Active lesson note does not exist: {note}")
-    opened = open_note(config, note, latest_tutor_heading(note))
-    if opened == "not-opened":
-        raise LearnError(f"Obsidian could not open the lesson note: {note}")
-    host_bundle_id = active.get("codex_host_bundle_id") or detect_codex_host_bundle_id()
-    terminal_tty = detect_ancestor_tty() if host_bundle_id == "com.apple.Terminal" else None
-    view = force_obsidian_reading_view(host_bundle_id, terminal_tty)
-    layout = apply_window_layout(config, active)
+    message_id = latest_tutor_message_id(note)
+    if message_id:
+        with state_lock(config):
+            record_display_requested_locked(config, active, message_id)
+        result = attempt_pending_display(config, active_session_id(active)) or {
+            "status": "failed",
+            "note_open": {"status": "failed", "stage": "display", "diagnostic": "Display request was superseded"},
+        }
+    else:
+        result = follow_lesson_output(config, note, active, None)
     return {
-        "opened": opened,
-        "layout": layout,
-        "view": view,
+        **result,
+        "opened": result["status"],
+        "view": result.get("note_open"),
         "note": str(note),
         "session_id": active_session_id(active),
         "lesson_id": active.get("lesson_id"),
+        "retry": None if result["status"] == "verified" else "Resolve the reported stage and run learnctl open again.",
+    }
+
+
+def command_layout(args) -> dict:
+    config = load_config()
+    active = find_current_active(config, args.session_id, args.cwd)
+    return {
+        "layout": apply_window_layout(config, active),
+        "session_id": active_session_id(active),
+        "lesson_id": active["lesson_id"],
     }
 
 
@@ -2725,6 +3146,89 @@ def unescaped_dollar_positions(text: str) -> list[int]:
 
 def strip_inline_code(text: str) -> str:
     return re.sub(r"(`+)[^`]*?\1", "", text)
+
+
+def prose_quality_diagnostics(markdown: str) -> list[dict]:
+    """Catch high-confidence prose regressions without pretending to understand correctness."""
+    diagnostics = []
+    in_fence = False
+    for line_number, raw in enumerate(markdown.splitlines(), 1):
+        if re.match(r"^\s*(```|~~~)", raw):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        line = strip_inline_code(raw)
+        line = re.sub(r"\$[^$\n]*\$", "", line)
+        line = re.sub(r"!?\[[^\]]*\]\([^)]*\)|https?://\S+|<[^>]+>", "", line)
+        prose = re.sub(r"^\s*(?:#{1,6}|[-*+] |>+|\d+[.)])\s*", "", line).strip()
+        if not prose:
+            continue
+        repeated = re.search(r"(?iu)\b([\w'-]{2,})\s+\1\b", prose)
+        if repeated:
+            diagnostics.append(
+                {"kind": "language", "line": line_number, "diagnostic": f"accidental repeated word: {repeated.group(0)!r}"}
+            )
+        words = re.findall(r"[\w'-]+", prose, flags=re.UNICODE)
+        if (
+            len(words) <= 4
+            and re.match(r"(?iu)^what\s+[A-Z][\w'-]+(?:\s*(?:\.{3}|…))?$", prose)
+        ):
+            diagnostics.append(
+                {"kind": "language", "line": line_number, "diagnostic": "incomplete 'What …' sentence or heading"}
+            )
+    return diagnostics
+
+
+def collect_math_expressions(markdown: str) -> list[dict]:
+    expressions = []
+    in_fence = False
+    in_display = False
+    display_lines = []
+    display_start = 0
+    for line_number, raw in enumerate(markdown.splitlines(), 1):
+        if re.match(r"^\s*(```|~~~)", raw):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        line = strip_inline_code(raw)
+        if re.sub(r"^\s*(?:>\s*)*", "", line).strip() == "$$":
+            if in_display:
+                expressions.append({"line": display_start, "expression": "\n".join(display_lines), "display": True})
+                display_lines = []
+            else:
+                display_start = line_number
+            in_display = not in_display
+            continue
+        if in_display:
+            display_lines.append(re.sub(r"^\s*(?:>\s*)*", "", line))
+            continue
+        dollars = unescaped_dollar_positions(line)
+        if len(dollars) % 2:
+            continue
+        for index in range(0, len(dollars), 2):
+            expressions.append(
+                {"line": line_number, "expression": line[dollars[index] + 1 : dollars[index + 1]], "display": False}
+            )
+    return expressions
+
+
+def structural_response_diagnostics(markdown: str, mathjax: dict | None = None) -> list[dict]:
+    errors = []
+    validate_math_lines(markdown.splitlines(), "assistant", errors)
+    diagnostics = prose_quality_diagnostics(markdown)
+    diagnostics.extend({"kind": "notation", "line": None, "diagnostic": error} for error in errors)
+    if mathjax and mathjax.get("status") == "failed":
+        diagnostics.extend(
+            {
+                "kind": "notation",
+                "line": failure.get("line"),
+                "diagnostic": f"MathJax: {str(failure.get('diagnostic') or 'rendering error')[:240]}",
+            }
+            for failure in mathjax.get("failures", [])
+        )
+    return diagnostics
 
 
 def validate_math_fragment(fragment: str, label: str, line_number: int, kind: str, errors: list[str]) -> None:
@@ -3458,6 +3962,20 @@ def command_validate(args) -> dict:
     config = load_config()
     session = Path(args.session).expanduser().resolve() if args.session else None
     errors = validate_artifacts(config, session=session, topic_slug=args.topic)
+    mathjax_status = "unavailable"
+    adapter = ObsidianAdapter(config)
+    if adapter.cli:
+        targets = [session] if session else list((learning_root(config) / "Sessions").glob("*.md"))
+        expressions = []
+        for target in filter(None, targets):
+            text = without_learner_transcript(target.read_text(encoding="utf-8"))
+            expressions.extend(collect_math_expressions(text))
+        rendered = adapter.validate_mathjax(expressions)
+        mathjax_status = rendered.get("status", "unavailable")
+        for failure in rendered.get("failures", []):
+            errors.append(
+                f"MathJax:{failure.get('line') or '?'}: {failure.get('diagnostic') or 'expression did not render'}"
+            )
     if args.render_mermaid and shutil.which("mmdc"):
         targets = [session] if session else list((learning_root(config) / "Sessions").glob("*.md"))
         for target in filter(None, targets):
@@ -3477,7 +3995,11 @@ def command_validate(args) -> dict:
                         errors.append(f"{target}: Mermaid block {index} did not render")
     if errors:
         raise LearnError("Validation failed:\n- " + "\n- ".join(errors))
-    return {"status": "ok", "checked": "configured Learning artifacts"}
+    return {
+        "status": "ok",
+        "checked": "configured Learning artifacts",
+        "mathjax": mathjax_status,
+    }
 
 
 def command_due(args):
@@ -3835,10 +4357,26 @@ def attached_session_for_lesson(config: dict, lesson_id: str) -> str | None:
 
 
 def command_resume(args) -> dict:
+    bundle = instruction_bundle()
     config = load_config()
     target_session = exact_runtime_session_id(args.session_id)
     with state_lock(config):
-        lesson = load_lesson(config, args.lesson_id)
+        if args.lesson_id:
+            lesson = load_lesson(config, args.lesson_id)
+        else:
+            topic = find_related_topic(config, args.topic)
+            if not topic:
+                raise LearnError(f"No matching topic found for {args.topic}")
+            matches = paused_lessons_for_topic(config, topic["slug"])
+            if not matches:
+                raise LearnError(f"No paused lesson found for topic {topic['slug']}")
+            if len(matches) > 1:
+                lesson_ids = ", ".join(item["lesson_id"] for item in matches)
+                raise LearnError(
+                    f"Multiple paused lessons match topic {topic['slug']}; "
+                    f"resume one with --lesson-id. Candidates: {lesson_ids}"
+                )
+            lesson = matches[0]
         if lesson["status"] in {"completed", "aborted"}:
             raise LearnError(f"Cannot resume a {lesson['status']} lesson")
         if lesson["status"] == "finishing":
@@ -3872,13 +4410,18 @@ def command_resume(args) -> dict:
         except (LearnError, OSError) as exc:
             mark_rendering_repair_locked(config, lesson, "resume-render", exc)
             raise SavedRenderingError("Lesson was resumed; rendering needs repair") from exc
-    return {
+    response = {
         "status": "resumed",
         "lesson_id": lesson["lesson_id"],
         "session_id": target_session,
         "note": str(note),
         "recovery": recovery_context(config, lesson),
+        "instruction_bundle": bundle,
     }
+    diagnostics = unresolved_response_diagnostics(config, lesson)
+    if diagnostics:
+        response["response_diagnostics"] = diagnostics
+    return response
 
 
 def command_repair(args) -> dict:
@@ -3977,7 +4520,7 @@ def command_doctor(args) -> dict:
         checks.append({"name": "artifact-validation", "ok": not errors, "detail": "; ".join(errors[:3]) or "ok"})
         try:
             health = read_operational_state(config)
-            health_ok = health.get("schema_version") == 1
+            health_ok = health.get("schema_version") == 2
             health_detail = (
                 f"{len(health.get('pending_rendering_repairs', []))} pending rendering repair(s)"
             )
@@ -3985,6 +4528,15 @@ def command_doctor(args) -> dict:
             health_ok = False
             health_detail = str(exc)
         checks.append({"name": "operational-health", "ok": health_ok, "detail": health_detail})
+        capabilities = ObsidianAdapter(config).capabilities()
+        checks.append(
+            {
+                "name": "obsidian-cli",
+                "ok": capabilities.get("status") == "available",
+                "optional": True,
+                "detail": capabilities,
+            }
+        )
     skill = Path.home() / ".agents/skills/learn"
     checks.append({"name": "skill", "ok": (skill / "SKILL.md").is_file(), "detail": str(skill)})
     hooks = Path.home() / ".codex/hooks.json"
@@ -3997,7 +4549,7 @@ def command_doctor(args) -> dict:
         except LearnError:
             hook_ok = False
     checks.append({"name": "hooks", "ok": hook_ok, "detail": str(hooks)})
-    result = {"ok": all(check["ok"] for check in checks), "checks": checks}
+    result = {"ok": all(check["ok"] or check.get("optional") for check in checks), "checks": checks}
     if not result["ok"]:
         raise LearnError(json.dumps(result, ensure_ascii=False))
     return result
@@ -4054,6 +4606,10 @@ def build_parser() -> argparse.ArgumentParser:
     open_command.add_argument("--cwd")
     open_command.add_argument("--session-id")
 
+    layout_command = sub.add_parser("layout", help="optionally tile the Codex host and Obsidian")
+    layout_command.add_argument("--cwd")
+    layout_command.add_argument("--session-id")
+
     for name in ("source", "finish"):
         item = sub.add_parser(name, help=f"process a structured {name} payload")
         payload = item.add_mutually_exclusive_group(required=True)
@@ -4100,7 +4656,9 @@ def build_parser() -> argparse.ArgumentParser:
     pause.add_argument("--session-id")
 
     resume = sub.add_parser("resume", help="attach an explicitly selected unfinished lesson")
-    resume.add_argument("--lesson-id", required=True)
+    resume_selector = resume.add_mutually_exclusive_group(required=True)
+    resume_selector.add_argument("--lesson-id")
+    resume_selector.add_argument("--topic")
     resume.add_argument("--session-id")
 
     repair = sub.add_parser("repair", help="regenerate lesson Markdown from canonical lesson records")
@@ -4166,6 +4724,7 @@ def main(argv=None) -> int:
         "context": command_context,
         "checkpoint": command_checkpoint,
         "open": command_open,
+        "layout": command_layout,
         "source": command_source,
         "validate": command_validate,
         "finish": command_finish,

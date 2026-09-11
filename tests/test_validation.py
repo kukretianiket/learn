@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 from pathlib import Path
@@ -110,25 +111,22 @@ class ValidationTests(LearnTestCase):
 
     def test_skill_enforces_obsidian_math_delimiters_and_mcq_slot_issuance(self):
         skill = (ROOT / ".agents/skills/learn/SKILL.md").read_text(encoding="utf-8")
+        pedagogy = (ROOT / ".agents/skills/learn/references/pedagogy.md").read_text(encoding="utf-8")
         rendering = (ROOT / ".agents/skills/learn/references/rendering.md").read_text(encoding="utf-8")
         self.assertIn("context --next-mcq --choices", skill)
         self.assertIn("--correct-count", skill)
         self.assertIn("--question-id <stable-id>", skill)
-        self.assertIn("Do not run `learnctl context` every turn", skill)
-        self.assertIn("checkpoint --json", skill)
-        self.assertIn("diagnose the relevant prerequisites", skill)
-        self.assertIn("diagnose only where it helps", skill)
-        self.assertIn("inspect the learner’s attempt first", skill)
-        self.assertIn("begin with unaided retrieval", skill)
-        self.assertIn("verify sources first", skill)
-        self.assertIn("learnctl.py open --session-id", skill)
-        self.assertIn("## Lesson begins", skill)
-        self.assertIn("Knowledge evaluation begins", skill)
-        self.assertIn("pre-send math audit", skill)
-        self.assertIn("4–6 high-information", skill)
-        self.assertIn("subjective self-map", skill)
-        self.assertIn("flowchart TD", skill)
-        self.assertIn("rather than forcing a DAG", skill)
+        self.assertIn("instruction_bundle", skill)
+        self.assertIn("complete sentences", skill)
+        self.assertIn("meaningful headings", skill)
+        self.assertIn("force force", skill)
+        self.assertIn("Renderable syntax is not proof", skill)
+        self.assertIn("Good spelling is not evidence of truth", skill)
+        self.assertIn("4–6 high-information", pedagogy)
+        self.assertIn("subjective self-map", pedagogy)
+        self.assertIn("## Lesson begins", pedagogy)
+        self.assertIn("flowchart TD", rendering)
+        self.assertIn("actual MathJax render check", rendering)
         self.assertIn(r"A. $\phi = \frac{2\pi n_{\mathrm{eff}}L}{\lambda_0}$", rendering)
         self.assertIn(r"do not use `\(...\)` or `\[...\]`", rendering)
 
@@ -179,6 +177,45 @@ class ValidationTests(LearnTestCase):
         result = self.cli("validate", "--session", str(self.note_for()))
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_post_capture_quality_regressions_are_separate_from_valid_terminology(self):
+        module = self.load_learnctl("learnctl_quality_test")
+        diagnostics = module.structural_response_diagnostics(
+            "## What Flynn…\n\nThe force force points inward.\n\nBackpropagation uses Jacobian-vector products."
+        )
+        messages = [item["diagnostic"] for item in diagnostics]
+        self.assertTrue(any("incomplete 'What" in item for item in messages))
+        self.assertTrue(any("force force" in item for item in messages))
+        self.assertFalse(any("Backpropagation" in item or "Jacobian" in item for item in messages))
+
+    def test_mathjax_failures_are_reported_separately_from_mathematical_review(self):
+        module = self.load_learnctl("learnctl_mathjax_test")
+        rendered = {
+            "status": "failed",
+            "failures": [{"line": 1, "diagnostic": "Undefined control sequence \\r"}],
+        }
+        diagnostics = module.structural_response_diagnostics(r"$\r_angled$ and $/r_angled$", rendered)
+        self.assertTrue(any(item["kind"] == "notation" and "MathJax" in item["diagnostic"] for item in diagnostics))
+        skill = (ROOT / ".agents/skills/learn/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("review whether each rendered symbol", skill)
+
+    def test_canonical_message_ids_create_stable_anchors_even_with_identical_timestamps(self):
+        started = self.start()
+        self.hook("Stop", "session-a", "assistant-one", "A long first response.\n" * 40)
+        self.hook("Stop", "session-a", "assistant-two", "Newest response starts here.")
+        lesson_path = self.vault / "Learning/_system/lessons" / f"{started['lesson_id']}.json"
+        lesson = json.loads(lesson_path.read_text(encoding="utf-8"))
+        tutor = [item for item in lesson["messages"] if item["role"] == "assistant"]
+        tutor[1]["captured_at"] = tutor[0]["captured_at"]
+        lesson_path.write_text(json.dumps(lesson), encoding="utf-8")
+        module = self.load_learnctl("learnctl_anchor_test")
+        config = json.loads((self.home / ".config/learn-codex/config.json").read_text(encoding="utf-8"))
+        module.render_lesson_note(config, lesson)
+        note = self.note_for()
+        self.assertEqual(module.latest_tutor_message_id(note), tutor[1]["message_id"])
+        text = note.read_text(encoding="utf-8")
+        self.assertEqual(text.count(f"### 🤖 Tutor · {tutor[0]['captured_at']}"), 2)
+        self.assertIn(f'<span id="learn-message-{tutor[1]["message_id"]}"></span>', text)
+
     def test_vertical_mermaid_allows_cycles_but_horizontal_flow_is_rejected(self):
         self.start()
         note = self.note_for()
@@ -224,69 +261,93 @@ class ValidationTests(LearnTestCase):
         self.assertIn("Vault%20with%20spaces%20%CE%A9", uri)
         self.assertIn("Learning%2FSessions%2FVectors%20%CE%A9.md", uri)
         self.assertNotIn(" ", uri)
-        anchored = module.obsidian_uri(config, note, "🤖 Tutor · latest")
-        self.assertIn("%23%F0%9F%A4%96%20Tutor%20%C2%B7%20latest", anchored)
 
-    def test_reading_view_is_forced_and_terminal_focus_is_restored(self):
-        module = self.load_learnctl("learnctl_reading_view_test")
-        completed = subprocess.CompletedProcess([], 0, stdout="OK\n", stderr="")
-        with mock.patch.object(module.sys, "platform", "darwin"), mock.patch.object(
-            module, "run_osascript", return_value=completed
-        ) as run:
-            result = module.force_obsidian_reading_view("com.apple.Terminal", "/dev/ttys004")
-        self.assertEqual(result, {"status": "reading", "focus_restored": True})
-        script, arguments = run.call_args.args
-        self.assertIn('click menu item "Reading View"', script)
-        self.assertIn("tty of candidateTab is targetTTY", script)
-        self.assertEqual(arguments, ["/dev/ttys004"])
-
-    def test_latest_tutor_heading_tracks_newest_output(self):
-        module = self.load_learnctl("learnctl_latest_heading_test")
-        note = self.vault / "Learning" / "Sessions" / "follow.md"
+    def test_cli_adapter_cold_launch_selects_exact_vault_path_and_verifies_preview(self):
+        module = self.load_learnctl("learnctl_open_test")
+        note = self.vault / "Learning" / "Sessions" / "Vectors Ω.md"
         note.parent.mkdir(parents=True, exist_ok=True)
-        note.write_text(
-            "### 🤖 Tutor · first\n\nOld\n\n### 🧑 Learner · reply\n\nHi\n\n### 🤖 Tutor · latest\n\nNew\n",
-            encoding="utf-8",
-        )
-        self.assertEqual(module.latest_tutor_heading(note), "🤖 Tutor · latest")
-
-    def test_obsidian_cli_is_preferred_and_uses_vault_relative_path(self):
-        spec = importlib.util.spec_from_file_location("learnctl_open_test", ROOT / ".agents/skills/learn/scripts/learnctl.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        note = self.vault / "Learning" / "Sessions" / "Vectors Ω.md"
+        note.write_text("# test\n", encoding="utf-8")
         config = {
             "vault_path": str(self.vault),
             "learning_folder": "Learning",
             "obsidian_vault_name": "Vault with spaces Ω",
         }
-        completed = subprocess.CompletedProcess([], 0)
+        results = [
+            subprocess.CompletedProcess([], 0, stdout="1.12.7\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout=f"{self.vault}\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout='{"status":"verified","mode":"preview","path":"Learning/Sessions/Vectors Ω.md","visible":true}\n', stderr=""),
+        ]
         with mock.patch.object(module.shutil, "which", return_value="/usr/local/bin/obsidian"), mock.patch.object(
-            module.subprocess, "run", return_value=completed
+            module.subprocess, "run", side_effect=results
         ) as run:
-            self.assertEqual(module.open_note(config, note), "obsidian-cli")
-        command = run.call_args.args[0]
-        self.assertEqual(command[:3], ["/usr/local/bin/obsidian", "vault=Vault with spaces Ω", "open"])
-        self.assertEqual(command[3], "path=Learning/Sessions/Vectors Ω.md")
+            result = module.ObsidianAdapter(config).launch_and_open(note, "a" * 64)
+        self.assertEqual(result["status"], "verified")
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands[1][1:4], ["vault=Vault with spaces Ω", "vault", "info=path"])
+        self.assertEqual(commands[2][-2:], ["open", "path=Learning/Sessions/Vectors Ω.md"])
+        self.assertNotIn("#", commands[2][-1])
+        eval_code = commands[3][-1]
+        self.assertIn('mode:\"preview\"', eval_code)
+        self.assertIn("pendingImages", eval_code)
+        self.assertIn("pendingDiagrams", eval_code)
+        self.assertIn("learn-message-" + "a" * 64, eval_code)
 
-    def test_failed_obsidian_cli_falls_back_to_uri_on_macos(self):
-        spec = importlib.util.spec_from_file_location("learnctl_fallback_test", ROOT / ".agents/skills/learn/scripts/learnctl.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+    def test_slow_launch_retries_readiness_and_wrong_vault_is_specific(self):
+        module = self.load_learnctl("learnctl_slow_open_test")
         note = self.vault / "Learning" / "Sessions" / "Vectors Ω.md"
-        config = {
-            "vault_path": str(self.vault),
-            "learning_folder": "Learning",
-            "obsidian_vault_name": "Vault with spaces Ω",
-        }
-        results = [subprocess.CompletedProcess([], 1), subprocess.CompletedProcess([], 0)]
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text("# test\n", encoding="utf-8")
+        config = {"vault_path": str(self.vault), "learning_folder": "Learning", "obsidian_vault_name": None}
+        results = [
+            subprocess.CompletedProcess([], 0, stdout="1.12.7\n", stderr=""),
+            subprocess.CompletedProcess([], 1, stdout="", stderr="starting"),
+            subprocess.CompletedProcess([], 0, stdout=f"{self.vault}\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout='{"status":"verified"}\n', stderr=""),
+        ]
         with mock.patch.object(module.shutil, "which", return_value="/usr/local/bin/obsidian"), mock.patch.object(
+            module.subprocess, "run", side_effect=results
+        ), mock.patch.object(module.time, "sleep"):
+            self.assertEqual(module.ObsidianAdapter(config).launch_and_open(note)["status"], "verified")
+
+        wrong = [subprocess.CompletedProcess([], 0, stdout="/wrong/vault\n", stderr="") for _ in range(6)]
+        adapter = module.ObsidianAdapter(config)
+        with mock.patch.object(adapter, "command", side_effect=wrong), mock.patch.object(module.time, "sleep"):
+            readiness = adapter._ready()
+        self.assertEqual(readiness["stage"], "select-vault")
+
+    def test_unavailable_cli_uri_result_is_explicitly_unverified(self):
+        module = self.load_learnctl("learnctl_fallback_test")
+        note = self.vault / "Learning/Sessions/Vectors Ω.md"
+        note.parent.mkdir(parents=True, exist_ok=True)
+        note.write_text("# test\n", encoding="utf-8")
+        config = {"vault_path": str(self.vault), "learning_folder": "Learning", "obsidian_vault_name": None}
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(module.shutil, "which", return_value=None), mock.patch.object(
             module.sys, "platform", "darwin"
-        ), mock.patch.object(module.subprocess, "run", side_effect=results) as run:
-            self.assertEqual(module.open_note(config, note), "obsidian-uri")
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual(run.call_args_list[1].args[0][0], "open")
-        self.assertIn("obsidian://open?", run.call_args_list[1].args[0][1])
+        ), mock.patch.object(module.subprocess, "run", return_value=completed):
+            result = module.ObsidianAdapter(config).launch_and_open(note)
+        self.assertEqual(result["status"], "unverified")
+        self.assertEqual(result["note_open"]["stage"], "verify-note")
+        self.assertIn("Enable the official Obsidian CLI", result["note_open"]["retry"])
+
+    def test_view_helper_replaces_source_or_live_editing_with_preview_and_restores_focus(self):
+        module = self.load_learnctl("learnctl_view_state_test")
+        self.assertNotIn("menu item", module.OBSIDIAN_VIEW_HELPER)
+        self.assertNotIn("System Events", module.OBSIDIAN_VIEW_HELPER)
+        self.assertIn('mode:"preview"', module.OBSIDIAN_VIEW_HELPER)
+        self.assertIn("source:false", module.OBSIDIAN_VIEW_HELPER)
+        self.assertIn("view.getMode()", module.OBSIDIAN_VIEW_HELPER)
+        config = {"vault_path": str(self.vault), "learning_folder": "Learning", "obsidian_vault_name": None}
+        note = self.vault / "Learning/Sessions/test.md"
+        active = {"codex_host_bundle_id": "com.microsoft.VSCode"}
+        with mock.patch.object(
+            module.ObsidianAdapter, "launch_and_open", side_effect=module.LearnError("navigation failed")
+        ), mock.patch.object(module, "restore_codex_focus", return_value={"status": "restored"}) as restore:
+            with self.assertRaisesRegex(module.LearnError, "navigation failed"):
+                module.follow_lesson_output(config, note, active, "a" * 64)
+        restore.assert_called_once_with("com.microsoft.VSCode", None)
 
     def test_sandboxed_macos_launch_is_deferred_for_escalated_retry(self):
         spec = importlib.util.spec_from_file_location("learnctl_escalation_test", ROOT / ".agents/skills/learn/scripts/learnctl.py")
@@ -300,6 +361,21 @@ class ValidationTests(LearnTestCase):
             module.os.environ, {"CODEX_SANDBOX": "seatbelt"}
         ), mock.patch.object(module.shutil, "which", return_value="/usr/local/bin/obsidian"):
             self.assertTrue(module.opening_needs_escalation({"window_layout": "desktop-split"}))
+
+    def test_open_never_applies_optional_tiling(self):
+        self.start()
+        module = self.load_learnctl("learnctl_open_without_layout_test")
+        config = json.loads((self.home / ".config/learn-codex/config.json").read_text(encoding="utf-8"))
+        args = argparse.Namespace(session_id="session-a", cwd=None)
+        with mock.patch.object(module, "load_config", return_value=config), mock.patch.dict(
+            module.os.environ,
+            {"CODEX_THREAD_ID": "session-a", "CODEX_SESSION_ID": "session-a"},
+            clear=True,
+        ), mock.patch.object(
+            module, "follow_lesson_output", return_value={"status": "verified", "note_open": {"status": "verified"}}
+        ), mock.patch.object(module, "apply_window_layout", side_effect=AssertionError("open must not tile")):
+            result = module.command_open(args)
+        self.assertEqual(result["status"], "verified")
 
 
 class InstallerTests(unittest.TestCase):

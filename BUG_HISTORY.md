@@ -1,6 +1,6 @@
 # Codex + Obsidian bug and feedback history
 
-This document records defects and design failures encountered while building and using the Codex + Obsidian implementation. It is a historical input to the forthcoming code review; it is not a refactor plan. “Fixed” means the current working tree contains a correction and regression coverage where practical. The original Pi implementation was not changed to make these fixes.
+This document records defects and design failures encountered while building and using the Codex + Obsidian implementation. It is a historical input to the forthcoming code review; it is not a refactor plan. “Fixed” means the current working tree contains a correction and regression coverage where practical. The original Pi implementation was not changed to make these fixes; its agents, extensions, and skills now live under [pi/](pi/README.md), with their contents preserved. This repository reorganization does not change Codex installation or vault paths.
 
 ## Summary
 
@@ -26,6 +26,7 @@ This document records defects and design failures encountered while building and
 | B-18 | `_system` accumulated disposable files without a lifecycle command | Fixed |
 | B-19 | Review dates used UTC rather than the user's local calendar date | Fixed |
 | B-20 | Session-identifier documentation overstated the uniqueness of `session_id` | Fixed |
+| B-21 | Conditional references, unchecked prose, and unverified Obsidian navigation weakened first-turn and delivery guarantees | Fixed with context-scoped bundles, diagnostics, and a CLI adapter |
 
 ## Detailed records
 
@@ -183,6 +184,14 @@ This document records defects and design failures encountered while building and
 - **Correction:** Documentation now distinguishes the immutable local `lesson_id`, exact runtime `session_id`, and exact runtime `turn_id`. New session notes store lesson and conversation identifiers in frontmatter; the session-note path and short filename suffix replace neither.
 - **Verification:** Canonical storage tests confirm UUID lesson identity, exact conversation binding, and exact hook turn isolation.
 
+### B-21 — Instructions and displayed state were assumed rather than verified
+
+- **Observed:** A session could begin after reading only the pedagogy reference; ordinary prose defects such as an incomplete “What Flynn…” heading or “force force” repetition had no explicit review; CLI exit and menu-click attempts were treated as opening or Reading View success; timestamp headings could collide; and a failed follow was swallowed.
+- **Causes:** Reference loading was conditional, quality categories were conflated, opening depended on optional tiling, and GUI control used file fragments and localized menu automation without state readback.
+- **Correction:** `start` and `resume` now generate a fixed-order, content-addressed bundle of all five references with no persistent read flag. The skill requires distinct language, notation/mathematical, and factual pre-send checks. Raw Tutor responses receive post-capture structural diagnostics. One official-CLI adapter launches with bounded readiness checks, targets the exact vault and path, uses application APIs to select the exact Markdown leaf and preview state, follows a `message_id` anchor, waits for delayed assets, verifies visibility, and restores Codex focus in cleanup. URI launch is unverified until state can be read back. Tiling is a separate `layout` command.
+- **Delivery state:** Operational health records the latest request, last verified display, per-session pending failures, failed stage, diagnostic, and latest response validation. Duplicate or later relevant hooks retry unresolved requests; navigation is serialized so an older queued request cannot replace a newer one.
+- **Verification:** Tests cover bundle delivery/recovery/missing files, prose and notation regressions, exact Unicode paths, cold and slow readiness, wrong vault, unavailable CLI, stable anchors with identical timestamps, long responses and delayed-asset logic, failure/retry, duplicate hooks, overlapping sessions, and focus cleanup. A real application smoke test remains host-specific and must be run from both Codex CLI and VS Code after GUI changes.
+
 ## Behavior clarifications that were not defects
 
 ### C-01 — Pausing a lesson
@@ -201,10 +210,10 @@ The symlinked Python utility and hooks use code changes immediately. An already-
 
 These are current boundaries, not claims of completed fixes:
 
-1. Math validation is deliberately structural, not a complete MathJax/TeX parser.
+1. Structural math validation is not a complete TeX parser. The controller additionally invokes Obsidian's MathJax renderer when its CLI is available; syntactically renderable mathematics still requires semantic review.
 2. Mermaid is not visually rendered in automated tests unless `mmdc` already exists; the current environment does not provide it.
-3. Window tiling and Reading View automation are macOS-specific and still require a manual real-application E2E check after material changes.
-4. Auto-follow runs after each newly logged assistant Stop event; it is not continuous background synchronization.
+3. Window tiling remains an optional macOS-specific action. Verified Reading View and follow use the cross-platform Obsidian CLI, while host-focus restoration and tiling still require manual real-application checks after material changes.
+4. Auto-follow is hook-driven rather than continuous. Failed requests remain visible and retry on the next relevant hook or explicit `open`.
 5. Diagnostic stopping remains model-executed policy rather than deterministic state tracked by `learnctl`.
 6. Distractor semantics remain model-generated even though answer positions use operating-system randomness.
 7. User-visible assistant process narration is logged because the hook must preserve raw assistant messages; prevention belongs in the skill behavior.

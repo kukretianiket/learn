@@ -76,12 +76,76 @@ class HookTests(LearnTestCase):
             "last_assistant_message": "Newest visible answer",
         }
         with mock.patch.object(module, "load_config", return_value=config), mock.patch.object(
-            module, "follow_lesson_output"
+            module, "opening_needs_escalation", return_value=False
+        ), mock.patch.object(module.ObsidianAdapter, "validate_mathjax", return_value={"status": "verified"}), mock.patch.object(
+            module, "follow_lesson_output", return_value={"status": "verified", "note_open": {"status": "verified"}}
         ) as follow:
             module.run_hook(data)
             module.run_hook(data)
         follow.assert_called_once()
-        self.assertTrue(follow.call_args.args[3].startswith("🤖 Tutor · "))
+        self.assertRegex(follow.call_args.args[3], r"^[0-9a-f]{64}$")
+
+    def test_failed_navigation_is_observable_and_duplicate_hook_retries_it(self):
+        self.start()
+        module = importlib.util.module_from_spec(
+            importlib.util.spec_from_file_location(
+                "learnctl_hook_retry_test", ROOT / ".agents/skills/learn/scripts/learnctl.py"
+            )
+        )
+        module.__spec__.loader.exec_module(module)
+        config = json.loads((self.home / ".config/learn-codex/config.json").read_text(encoding="utf-8"))
+        config["open_notes_automatically"] = True
+        data = {
+            "hook_event_name": "Stop",
+            "session_id": "session-a",
+            "turn_id": "retry-turn",
+            "cwd": str(self.cwd),
+            "last_assistant_message": "Raw response remains canonical.",
+        }
+        failed = {
+            "status": "failed",
+            "note_open": {"status": "failed", "stage": "verify-note", "diagnostic": "anchor not visible"},
+        }
+        succeeded = {"status": "verified", "note_open": {"status": "verified"}}
+        with mock.patch.object(module, "load_config", return_value=config), mock.patch.object(
+            module, "opening_needs_escalation", return_value=False
+        ), mock.patch.object(module.ObsidianAdapter, "validate_mathjax", return_value={"status": "verified"}), mock.patch.object(
+            module, "follow_lesson_output", side_effect=[failed, succeeded]
+        ) as follow:
+            module.run_hook(data)
+            health = module.read_operational_state(config)
+            self.assertEqual(health["failed_stage"], "verify-note")
+            self.assertEqual(health["diagnostic"], "anchor not visible")
+            self.assertIsNotNone(health["pending_display"])
+            module.run_hook(data)
+        self.assertEqual(follow.call_count, 2)
+        health = module.read_operational_state(config)
+        self.assertIsNone(health["pending_display"])
+        self.assertIsNone(health["failed_stage"])
+        self.assertEqual(
+            health["latest_requested_message"]["message_id"],
+            health["last_successfully_displayed_message"]["message_id"],
+        )
+
+    def test_overlapping_sessions_keep_independent_pending_display_requests(self):
+        self.start("session-a", title="Topic A")
+        self.start("session-b", title="Topic B")
+        module = importlib.util.module_from_spec(
+            importlib.util.spec_from_file_location(
+                "learnctl_overlap_test", ROOT / ".agents/skills/learn/scripts/learnctl.py"
+            )
+        )
+        module.__spec__.loader.exec_module(module)
+        config = json.loads((self.home / ".config/learn-codex/config.json").read_text(encoding="utf-8"))
+        with module.state_lock(config):
+            lesson_a = module.read_active(config, "session-a")
+            lesson_b = module.read_active(config, "session-b")
+            module.record_display_requested_locked(config, lesson_a, "a" * 64)
+            module.record_display_requested_locked(config, lesson_b, "b" * 64)
+        health = module.read_operational_state(config)
+        self.assertEqual(set(health["pending_displays"]), {"session-a", "session-b"})
+        self.assertEqual(health["pending_displays"]["session-a"]["message_id"], "a" * 64)
+        self.assertEqual(health["pending_displays"]["session-b"]["message_id"], "b" * 64)
 
     def test_inactive_hook_captures_only_explicit_activation(self):
         self.hook("UserPromptSubmit", "unrelated", "t0", "ordinary unrelated work")
@@ -166,3 +230,25 @@ class HookTests(LearnTestCase):
         self.assertEqual(health["pending_rendering_repairs"], [relative])
         status = self.cli("status", "--json-output")
         self.assertEqual(json.loads(status.stdout)["operational_health"], health)
+
+    def test_structural_diagnostics_preserve_raw_canonical_assistant_message(self):
+        started = self.start()
+        raw = "## What Flynn…\n\nThe force force is written as $\\r_angled$."
+        self.hook("Stop", "session-a", "quality-turn", raw)
+        lesson_path = self.vault / "Learning/_system/lessons" / f"{started['lesson_id']}.json"
+        lesson = json.loads(lesson_path.read_text(encoding="utf-8"))
+        self.assertEqual(lesson["messages"][-1]["markdown"], raw)
+        health = json.loads(
+            (self.vault / "Learning/_system/operational.json").read_text(encoding="utf-8")
+        )
+        validation = health["last_response_validation"]
+        self.assertEqual(validation["status"], "failed")
+        self.assertEqual(validation["message_id"], lesson["messages"][-1]["message_id"])
+        self.assertTrue(any(item["kind"] == "language" for item in validation["diagnostics"]))
+        self.hook("UserPromptSubmit", "session-a", "recover-turn", "$learn recover with diagnostics")
+        recovered = self.cli(
+            "start", "--session-id", "session-a", "--title", "Test Topic",
+            "--goal", "Build a connected working model", "--mode", "learn",
+        )
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertTrue(json.loads(recovered.stdout)["response_diagnostics"])

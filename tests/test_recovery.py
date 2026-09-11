@@ -32,6 +32,45 @@ class RecoveryTests(LearnTestCase):
             "checkpoint", "--session-id", session, "--json", json.dumps(payload)
         )
 
+    def test_start_and_resume_deliver_complete_content_addressed_instruction_bundle(self):
+        started = self.start(prompt="$learn load every reference")
+        bundle = started["instruction_bundle"]
+        expected = [
+            "references/pedagogy.md",
+            "references/rendering.md",
+            "references/source-policy.md",
+            "references/evidence-model.md",
+            "references/state-schemas.md",
+        ]
+        self.assertEqual([item["filename"] for item in bundle["files"]], expected)
+        self.assertTrue(bundle["fingerprint"].startswith("sha256:"))
+        for item in bundle["files"]:
+            self.assertTrue(item["content"].startswith("# "))
+            self.assertEqual(len(item["sha256"]), 64)
+
+        context = json.loads(self.cli("context", "--session-id", "session-a").stdout)
+        self.assertNotIn("instruction_bundle", context)
+        self.assertLessEqual(context["history"]["returned_count"], 8)
+
+        self.assertEqual(self.cli("pause", "--session-id", "session-a").returncode, 0)
+        resumed = self.cli(
+            "resume", "--lesson-id", started["lesson_id"], "--session-id", "session-b"
+        )
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        recovered = json.loads(resumed.stdout)
+        self.assertEqual(recovered["instruction_bundle"]["fingerprint"], bundle["fingerprint"])
+        self.assertLessEqual(recovered["recovery"]["history"]["returned_count"], 8)
+
+    def test_instruction_bundle_fails_clearly_when_reference_is_missing(self):
+        spec = importlib.util.spec_from_file_location(
+            "learnctl_missing_reference_test", ROOT / ".agents/skills/learn/scripts/learnctl.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with mock.patch.object(module, "REFERENCE_ORDER", ("missing-contract.md",)):
+            with self.assertRaisesRegex(module.LearnError, "Required Learn reference is missing"):
+                module.instruction_bundle()
+
     def test_checkpoint_is_compact_resolved_and_retry_safe(self):
         started = self.start(prompt="$learn checkpoint recovery")
         before = self.canonical(started["lesson_id"])

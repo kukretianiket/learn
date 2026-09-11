@@ -27,7 +27,7 @@ Introduce the visual with its purpose, explain the one relationship it reveals, 
 
 ## Mermaid concept maps
 
-Adapt the upstream visualization discipline: one visual should carry one structural idea with the fewest necessary elements. A substantial lesson gets a small local concept map, not a global graph and not decoration.
+Adapt the upstream Pi visualization discipline (repository source: `pi/skills/visualize/SKILL.md`): one visual should carry one structural idea with the fewest necessary elements. A substantial lesson gets a small local concept map, not a global graph and not decoration.
 
 - Use `flowchart TD` for lesson concept maps. Do not use `LR` or `RL`; the half-screen Obsidian pane must not require horizontal scrolling.
 - Prefer one short vertical main chain, at most about 5–7 nodes, short quoted labels, and only edges that teach something. Prune any node whose removal leaves the idea intact.
@@ -45,6 +45,8 @@ Before every response containing math:
 1. Ignore fenced and inline code, then scan every remaining character for a backslash command, `_`, or `^` outside math delimiters.
 2. Reject every `\(`, `\)`, `\[`, `\]`, bare parenthesized formula, padded inline delimiter, multi-line inline span, or same-line display delimiter.
 3. Check `$` pairs independently on every physical line. Check that each `$$` is alone on its line and has one closing delimiter.
-4. Check braces, command spelling, explicit subscripts, and text operators. Specifically reject forms like `\lambda0`, `\sqrt2`, and `n{\text{eff}}`.
+4. Check braces, command spelling, explicit subscripts, and text operators. Use an actual MathJax render check when the environment provides one; structural patterns are not a general LaTeX parser. Specifically reject forms like `\lambda0`, `\sqrt2`, and `n{\text{eff}}`.
 5. Audit every list item, table cell, callout line, and diagnostic option—not only prose paragraphs. A valid option is `A. $\phi = \frac{2\pi n_{\mathrm{eff}}L}{\lambda_0}$`.
 6. Mentally read the final raw Markdown as Obsidian receives it. Do not rely on how the Codex terminal happened to render the draft.
+
+After syntax renders, review the mathematics separately: verify that every symbol denotes the intended quantity, every operator is the intended operator, and each expression supports the stated claim. For example, a slash accidentally typed where a backslash was intended may remain syntactically renderable while expressing something else. Rendering success is not mathematical validation, and prose quality is not factual validation.

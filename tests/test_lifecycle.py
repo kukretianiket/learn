@@ -51,6 +51,52 @@ class LifecycleTests(LearnTestCase):
         self.assertNotIn("must not cross the rebind", markdown)
         self.assertIn("belongs to resumed lesson", markdown)
 
+    def test_start_refuses_duplicate_when_same_topic_has_a_paused_lesson(self):
+        started = self.start(session="old-conversation", title="Shared Topic")
+        self.assertEqual(self.cli("pause", "--session-id", "old-conversation").returncode, 0)
+        notes_before = set((self.vault / "Learning" / "Sessions").glob("*.md"))
+        lessons_before = set((self.vault / "Learning" / "_system" / "lessons").glob("*.json"))
+        self.hook("UserPromptSubmit", "new-conversation", "new-turn", "$learn Shared Topic")
+
+        duplicate = self.cli(
+            "start", "--title", "Shared Topic", "--goal", "Continue", "--mode", "learn",
+            "--session-id", "new-conversation",
+        )
+
+        self.assertEqual(duplicate.returncode, 2)
+        self.assertIn(started["lesson_id"], duplicate.stderr)
+        self.assertIn("resume --lesson-id", duplicate.stderr)
+        self.assertEqual(set((self.vault / "Learning" / "Sessions").glob("*.md")), notes_before)
+        self.assertEqual(
+            set((self.vault / "Learning" / "_system" / "lessons").glob("*.json")), lessons_before
+        )
+
+    def test_resume_by_topic_selects_the_only_paused_lesson(self):
+        started = self.start(session="old-conversation", title="Shared Topic")
+        self.assertEqual(started["status"], "started")
+        self.assertEqual(self.cli("pause", "--session-id", "old-conversation").returncode, 0)
+
+        resumed = self.cli("resume", "--topic", "shared-topic", "--session-id", "new-conversation")
+
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        payload = json.loads(resumed.stdout)
+        self.assertEqual(payload["status"], "resumed")
+        self.assertEqual(payload["lesson_id"], started["lesson_id"])
+        self.assertEqual(payload["note"], started["note"])
+
+    def test_resume_by_topic_requires_id_when_multiple_paused_lessons_match(self):
+        first = self.start(session="first-conversation", title="Shared Topic")
+        second = self.start(session="second-conversation", title="shared-topic")
+        self.assertEqual(self.cli("pause", "--session-id", "first-conversation").returncode, 0)
+        self.assertEqual(self.cli("pause", "--session-id", "second-conversation").returncode, 0)
+
+        resumed = self.cli("resume", "--topic", "Shared Topic", "--session-id", "new-conversation")
+
+        self.assertEqual(resumed.returncode, 2)
+        self.assertIn("Multiple paused lessons", resumed.stderr)
+        self.assertIn(first["lesson_id"], resumed.stderr)
+        self.assertIn(second["lesson_id"], resumed.stderr)
+
     def test_resume_refuses_to_steal_an_attached_lesson(self):
         started = self.start(session="attached-conversation")
         result = self.cli("resume", "--lesson-id", started["lesson_id"], "--session-id", "other-conversation")
