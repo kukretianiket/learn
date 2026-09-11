@@ -6,23 +6,6 @@ amosblomqvist's AI learning system from [How I Use AI to Learn Things](https://w
 
 See [BUG_HISTORY.md](BUG_HISTORY.md) for known issues, fixes, and remaining limitations.
 
-## Original Pi version
-
-Clone this repository as `.pi` in the root of a learning project:
-
-```bash
-git clone https://github.com/amosblomqvist/learn .pi
-```
-
-Then open Pi from that directory. The original implementation includes:
-
-- `skills/teach/` — teaching process
-- `skills/visualize/` — visual generation
-- `extensions/` — questions, quizzes, session logging, and visual tools
-- `agents/` — research and visual subagents
-
-It requires [Pi](https://github.com/earendil-works/pi), the bundled question extension, and optionally a compatible subagent implementation such as [pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents). Without subagents, research verification and generated visuals are unavailable.
-
 ## Codex + Obsidian version
 
 This version provides stateful lessons in Codex and mirrors the conversation into Markdown notes in Obsidian. It uses a skill, two Codex hooks, and a Python standard-library CLI—no Obsidian plugin, database, or MCP server.
